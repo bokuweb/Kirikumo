@@ -13,7 +13,8 @@ use gpui::{
     WindowOptions, point, px, size,
 };
 use gpui_component::Root;
-use kirikumo_kube::{Cluster, KubeConfig, Rest, Scripted, kubeconfig};
+use kirikumo_kube::{Cluster, KubeConfig, ResourceKey, Rest, Scripted, kubeconfig};
+use kirikumo_ui::detail::Target;
 use kirikumo_ui::settings::{self, AppSettings};
 use kirikumo_ui::{Mode, Paths};
 use std::sync::Arc;
@@ -62,6 +63,24 @@ fn source(settings: &AppSettings) -> (Arc<dyn Cluster>, Option<KubeConfig>) {
     }
 }
 
+/// `KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t`: an object to open as soon
+/// as the window is up, as `Kind/namespace/name` with the namespace left
+/// empty for a cluster-scoped kind. For screenshots — and it goes through the
+/// same path a link in the detail panel does, so it exercises what a reader
+/// would.
+fn open_at_launch() -> Option<Target> {
+    let value = std::env::var("KIRIKUMO_DEMO_OPEN").ok()?;
+    let mut parts = value.splitn(3, '/');
+    let key = ResourceKey::parse(parts.next()?)?;
+    let namespace = parts.next()?;
+    let name = parts.next()?;
+    Some(Target::Object {
+        key,
+        namespace: Some(namespace.to_string()).filter(|namespace| !namespace.is_empty()),
+        name: name.to_string(),
+    })
+}
+
 fn main() -> Result<()> {
     let paths = Paths::from_env()?;
     paths.ensure()?;
@@ -106,6 +125,7 @@ fn main() -> Result<()> {
 
             let open_palette =
                 std::env::var_os("KIRIKUMO_DEMO_PALETTE").is_some_and(|value| value == "1");
+            let open = open_at_launch();
             cx.open_window(options, |window, cx| {
                 let shell = cx.new(|cx| {
                     kirikumo_views::Shell::new(
@@ -117,6 +137,9 @@ fn main() -> Result<()> {
                         cx,
                     )
                 });
+                if let Some(target) = open {
+                    shell.update(cx, |shell, cx| shell.open_at_launch(target, cx));
+                }
                 if open_palette {
                     shell.update(cx, |shell, cx| shell.open_palette_at_launch(cx));
                 }

@@ -15,7 +15,7 @@ use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
     ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, LogRequest,
-    Object, ObjectList, ResourceKey, WatchEvent, watch,
+    Metrics, Object, ObjectList, ResourceKey, WatchEvent, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
@@ -50,6 +50,10 @@ pub struct Store {
     lists: HashMap<ListKey, Fetch<ObjectList>>,
     events: HashMap<String, Fetch<Vec<EventRecord>>>,
     logs: HashMap<String, Fetch<String>>,
+    /// What every node is using, when the cluster has a metrics server.
+    node_metrics: Fetch<Vec<Metrics>>,
+    /// What every pod in a namespace is using, likewise, by namespace.
+    pod_metrics: HashMap<Option<String>, Fetch<Vec<Metrics>>>,
     /// The list the window is looking at, and so the only one worth
     /// following. A cluster with ten thousand pods must not be streamed
     /// because the sidebar mentions pods (roadmap §4.7).
@@ -93,6 +97,8 @@ impl Store {
             lists: HashMap::new(),
             events: HashMap::new(),
             logs: HashMap::new(),
+            node_metrics: Fetch::Idle,
+            pod_metrics: HashMap::new(),
             followed: None,
             watch: None,
             generation: 0,
@@ -157,6 +163,8 @@ impl Store {
         self.lists.clear();
         self.events.clear();
         self.logs.clear();
+        self.node_metrics = Fetch::Idle;
+        self.pod_metrics.clear();
         self.stop_watch();
         self.followed = None;
         cx.emit(StoreEvent::Changed);
@@ -463,6 +471,62 @@ impl Store {
                 this.logs.entry(key).or_default().finish(result);
             },
         );
+    }
+
+    /// Ask for what a kind's objects are using, if it is a kind that uses
+    /// anything and the cluster can say.
+    ///
+    /// `metrics.k8s.io` is an optional add-on. A cluster without it answers
+    /// with a failure, which is kept as one and never retried on its own: the
+    /// detail panel simply draws no *Using* section, which is the truthful
+    /// thing to draw when nobody can say.
+    pub fn ensure_metrics(&mut self, kind: &str, namespace: Option<&str>, cx: &mut Context<Self>) {
+        match kind {
+            "Node" => {
+                if !self.node_metrics.is_idle() {
+                    return;
+                }
+                self.node_metrics.begin();
+                self.fetch(
+                    cx,
+                    |cluster| cluster.node_metrics(),
+                    |this, result, _| this.node_metrics.finish(result),
+                );
+            }
+            "Pod" => {
+                let scope = namespace.map(str::to_string);
+                if self
+                    .pod_metrics
+                    .get(&scope)
+                    .is_some_and(|fetch| !fetch.is_idle())
+                {
+                    return;
+                }
+                self.pod_metrics.entry(scope.clone()).or_default().begin();
+                let asked = scope.clone();
+                self.fetch(
+                    cx,
+                    move |cluster| cluster.pod_metrics(asked.as_deref()),
+                    move |this, result, _| {
+                        this.pod_metrics.entry(scope).or_default().finish(result);
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// What one object is using, if anything has said.
+    pub fn metrics_for(&self, kind: &str, namespace: Option<&str>, name: &str) -> Option<&Metrics> {
+        let held = match kind {
+            "Node" => self.node_metrics.value()?,
+            "Pod" => self
+                .pod_metrics
+                .get(&namespace.map(str::to_string))?
+                .value()?,
+            _ => return None,
+        };
+        held.iter().find(|metrics| metrics.name == name)
     }
 
     /// Ask the cluster who it is, what it serves and what namespaces it has.

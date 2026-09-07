@@ -16,6 +16,7 @@ use gpui::*;
 use gpui_component::{Icon, StyledExt as _, h_flex, v_flex};
 use kirikumo_kube::{LogRequest, Object, yaml};
 use kirikumo_ui::assets::icon;
+use kirikumo_ui::detail::Target;
 use kirikumo_ui::{Tokens, detail, time};
 use serde_json::Value;
 
@@ -47,6 +48,15 @@ impl Tab {
     }
 }
 
+/// What the reader did in the panel.
+pub enum DetailEvent {
+    /// Go to something this object points at: up to its controller, or down
+    /// to what its selector selects.
+    Navigate(Target),
+}
+
+impl EventEmitter<DetailEvent> for Detail {}
+
 /// The right panel.
 pub struct Detail {
     store: Entity<Store>,
@@ -59,8 +69,15 @@ pub struct Detail {
 impl Detail {
     /// A panel over a store, showing nothing until told what to.
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
-        cx.subscribe(&store, |_, _, _: &StoreEvent, cx| cx.notify())
-            .detach();
+        // Asked again on every change, not just when a tab is opened: an
+        // object reached by a link is drawn before the list it lives in has
+        // landed, so the moment it does the tab has to ask for its events.
+        // `ensure` is idempotent — it starts a fetch only when one is idle.
+        cx.subscribe(&store, |this: &mut Self, _, _: &StoreEvent, cx| {
+            this.ensure(cx);
+            cx.notify();
+        })
+        .detach();
         Self {
             store,
             key: None,
@@ -109,6 +126,13 @@ impl Detail {
         let Some(object) = self.object(cx) else {
             return;
         };
+        // Usage is on the Overview, which is the tab this panel opens on, and
+        // it is one request per namespace rather than per object.
+        let kind = self.kind();
+        let namespace = object.meta.namespace.clone();
+        self.store.update(cx, |store, cx| {
+            store.ensure_metrics(&kind, namespace.as_deref(), cx)
+        });
         match self.tab {
             Tab::Events => {
                 let uid = object.meta.uid.clone();
@@ -124,6 +148,14 @@ impl Detail {
             }
             Tab::Overview | Tab::Yaml => {}
         }
+    }
+
+    /// The kind being shown.
+    fn kind(&self) -> String {
+        self.key
+            .as_ref()
+            .map(|(kind, _, _)| kind.kind.clone())
+            .unwrap_or_default()
     }
 
     /// The object being shown, out of the store's lists.
@@ -161,11 +193,7 @@ impl Detail {
     /// The name, the kind and the health, across the top.
     fn header(&self, object: &Object, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let tokens = Tokens::global(cx).clone();
-        let kind = self
-            .key
-            .as_ref()
-            .map(|(kind, _, _)| kind.kind.clone())
-            .unwrap_or_default();
+        let kind = self.kind();
         let health = kirikumo_kube::health::of(&kind, object);
         let mut where_it_is = kind.clone();
         if let Some(namespace) = &object.meta.namespace {
@@ -258,12 +286,13 @@ impl Detail {
     /// The Overview tab.
     fn overview(&self, object: &Object, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
-        let kind = self
-            .key
-            .as_ref()
-            .map(|(kind, _, _)| kind.kind.clone())
-            .unwrap_or_default();
-        let overview = detail::overview(&kind, object, Utc::now());
+        let kind = self.kind();
+        let usage = self
+            .store
+            .read(cx)
+            .metrics_for(&kind, object.meta.namespace.as_deref(), &object.meta.name)
+            .cloned();
+        let overview = detail::overview(&kind, object, usage.as_ref(), Utc::now());
 
         v_flex()
             .id("overview")
@@ -282,7 +311,8 @@ impl Detail {
                             .text_color(tokens.colors().text_muted)
                             .child(title)
                     }))
-                    .children(section.facts.into_iter().map(|fact| {
+                    .children(section.facts.into_iter().enumerate().map(|(index, fact)| {
+                        let link = fact.link.clone();
                         h_flex()
                             .w_full()
                             .gap_3()
@@ -297,11 +327,30 @@ impl Detail {
                             )
                             .child(
                                 div()
+                                    .id(("fact", index))
                                     .flex_1()
                                     .text_size(px(12.))
                                     .when(fact.mono, |this| this.font_family("monospace"))
-                                    .text_color(tokens.colors().text_secondary)
-                                    .child(fact.value),
+                                    // A fact that goes somewhere is drawn as a
+                                    // link, in the accent, and never as an
+                                    // underline in the muted grey that reads
+                                    // as struck out.
+                                    .when(link.is_some(), |this| {
+                                        this.cursor_pointer()
+                                            .text_color(tokens.colors().accent)
+                                            .hover(|this| {
+                                                this.text_color(tokens.colors().accent.opacity(0.8))
+                                            })
+                                    })
+                                    .when(link.is_none(), |this| {
+                                        this.text_color(tokens.colors().text_secondary)
+                                    })
+                                    .child(fact.value)
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        if let Some(target) = link.clone() {
+                                            cx.emit(DetailEvent::Navigate(target));
+                                        }
+                                    })),
                             )
                     }))
             }))

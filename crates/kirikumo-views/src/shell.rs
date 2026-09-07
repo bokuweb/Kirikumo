@@ -7,7 +7,7 @@
 //! sidebar, the table, the detail — is mounted here exactly the way a host
 //! would mount it.
 
-use crate::detail::Detail;
+use crate::detail::{Detail, DetailEvent};
 use crate::palette::{Palette, PaletteEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::store::Store;
@@ -19,6 +19,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, InteractiveElementExt as _, StyledExt as _, h_flex, v_flex};
 use kirikumo_kube::{Cluster, KubeConfig, ResourceKey, Rest, Scripted};
 use kirikumo_ui::assets::icon;
+use kirikumo_ui::detail::Target;
 use kirikumo_ui::palette::{Action, Command, Here};
 use kirikumo_ui::settings::{self, AppSettings};
 use kirikumo_ui::{HEADER_HEIGHT, Layout, Mode, Panel, Paths, TRAFFIC_LIGHT_INSET, Tokens, nav};
@@ -119,6 +120,11 @@ pub struct Shell {
     showing_palette: bool,
     /// The palette was asked for before there was a window to open it in.
     open_palette_pending: bool,
+    /// Something to put in the filter box at the next frame, which is the
+    /// next place with a window to put it with.
+    pending_filter: Option<String>,
+    /// Something to open once discovery has landed.
+    open_at_launch: Option<Target>,
     /// The appearance changed and the theme has to be installed at the next
     /// frame, which is the first place with a window to ask.
     retheme: bool,
@@ -190,6 +196,9 @@ impl Shell {
                 this.persist();
             }
         }));
+        subscriptions.push(cx.subscribe(&detail, |this, _, event, cx| match event {
+            DetailEvent::Navigate(target) => this.navigate(target.clone(), cx),
+        }));
         subscriptions.push(cx.subscribe(&table, |this, _, event, cx| match event {
             TableEvent::Open(key) => {
                 let key = key.clone();
@@ -255,6 +264,8 @@ impl Shell {
             palette,
             showing_palette: false,
             open_palette_pending: false,
+            pending_filter: None,
+            open_at_launch: None,
             retheme: false,
             resizing: None,
             transitions: Vec::new(),
@@ -274,6 +285,47 @@ impl Shell {
         self.persist();
         self.detail.update(cx, |detail, cx| detail.clear(cx));
         self.table.update(cx, |table, cx| table.show(key, cx));
+        cx.notify();
+    }
+
+    /// Follow a link out of the detail panel.
+    ///
+    /// Both directions land the same way — the kind is listed, the filter box
+    /// is filled in, and the reader can see *why* the table narrowed, because
+    /// what narrowed it is written in the box they can clear.
+    fn navigate(&mut self, target: Target, cx: &mut Context<Self>) {
+        let (key, namespace, query, object) = match target {
+            Target::Object {
+                key,
+                namespace,
+                name,
+            } => (key, namespace, name.clone(), Some(name)),
+            Target::Filtered {
+                key,
+                namespace,
+                query,
+            } => (key, namespace, query, None),
+        };
+        // A cluster-scoped kind is not scoped by the namespace it was reached
+        // from: a pod's node does not live in the pod's namespace.
+        let namespaced = self
+            .store
+            .read(cx)
+            .resource(&key)
+            .is_none_or(|resource| resource.namespaced);
+        if namespaced && namespace.is_some() {
+            self.set_namespace(namespace.clone(), cx);
+        }
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.adopt(Some(key.clone()), cx));
+        // `show_kind` clears the panel, so the object is opened after it.
+        self.show_kind(key.clone(), cx);
+        self.pending_filter = Some(query);
+        if let Some(name) = object {
+            let namespace = namespace.filter(|_| namespaced);
+            self.detail
+                .update(cx, |detail, cx| detail.show((key, namespace, name), cx));
+        }
         cx.notify();
     }
 
@@ -543,6 +595,16 @@ impl Shell {
     fn on_focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
         let handle = self.filter.read(cx).focus_handle(cx);
         handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Open one object as soon as the window is up.
+    ///
+    /// For demos and screenshots (`KIRIKUMO_DEMO_OPEN=Pod/shop/api-…`, the
+    /// namespace empty for a cluster-scoped kind). Goes through the same path
+    /// a link does, so it exercises what a reader would.
+    pub fn open_at_launch(&mut self, target: Target, cx: &mut Context<Self>) {
+        self.open_at_launch = Some(target);
         cx.notify();
     }
 
@@ -985,6 +1047,18 @@ impl Render for Shell {
         // hold four commands and nothing else, which is a screenshot of
         // nothing. A reader pressing ⌘K that early gets the same short list,
         // and the next press gets the full one — it is rebuilt every time.
+        if let Some(query) = self.pending_filter.take() {
+            self.filter
+                .update(cx, |input, cx| input.set_value(query.clone(), window, cx));
+            self.table
+                .update(cx, |table, cx| table.set_query(query, cx));
+        }
+        if self.open_at_launch.is_some()
+            && self.store.read(cx).catalogue().value().is_some()
+            && let Some(target) = self.open_at_launch.take()
+        {
+            self.navigate(target, cx);
+        }
         if self.open_palette_pending && self.store.read(cx).catalogue().value().is_some() {
             self.open_palette_pending = false;
             self.on_toggle_palette(&TogglePalette, window, cx);

@@ -20,7 +20,7 @@ It is the third window in a family that becomes one application: **Ginka** (codi
 
 **The table is live.** The list on screen — and only that one — is followed: a thread reads the watch, bookmarks keep the resume point moving, a `410 Gone` re-lists, a dropped connection backs off, and only the rows whose objects actually moved are formatted again. `KIRIKUMO_DEMO=1` has a scripted watch, so the whole path can be exercised without a cluster.
 
-`⌘K` reaches every kind, namespace, context and command by name. What is *not* there yet: metrics, owner/child navigation, log follow, and no writes at all. See `docs/roadmap.md` §5.
+`⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, and reports what a pod or node is using when the cluster has a metrics server. What is *not* there yet: log follow, and no writes at all. See `docs/roadmap.md` §5.
 
 ## Commands
 
@@ -29,6 +29,7 @@ cargo run                                   # the desktop app, on the current co
 cargo run --release
 KIRIKUMO_DEMO=1 cargo run                   # the same window over a scripted cluster, no network
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_PALETTE=1 cargo run   # ...opened on the palette, for screenshots
+KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t cargo run   # ...opened on one object
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all

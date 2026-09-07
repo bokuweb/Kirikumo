@@ -7,8 +7,37 @@
 //! describe` reduced to what fits in a 420 px column.
 
 use chrono::{DateTime, Utc};
-use kirikumo_kube::{Level, Object};
+use kirikumo_kube::{Level, Metrics, Object, ResourceKey, quantity};
 use serde_json::Value;
+
+/// Somewhere a fact points.
+///
+/// The two moves a person makes in a cluster viewer: *up*, from a pod to the
+/// thing that made it, and *down*, from a controller to what it made. Up is a
+/// single object and is exact. Down is a question — "which pods does this
+/// select?" — and is answered the way a person would answer it, by putting
+/// the controller's own selector in the filter box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// One object: list its kind and open it.
+    Object {
+        /// Which kind.
+        key: ResourceKey,
+        /// Its namespace, or `None` for a cluster-scoped kind.
+        namespace: Option<String>,
+        /// Its name.
+        name: String,
+    },
+    /// A kind, filtered: list it and put this in the filter box.
+    Filtered {
+        /// Which kind.
+        key: ResourceKey,
+        /// Which namespace to scope to.
+        namespace: Option<String>,
+        /// What to type into the filter for the reader.
+        query: String,
+    },
+}
 
 /// One labelled fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +48,8 @@ pub struct Fact {
     pub value: String,
     /// Whether the value is an identifier, and so drawn in the mono family.
     pub mono: bool,
+    /// Where this fact goes when it is clicked, if it goes anywhere.
+    pub link: Option<Target>,
 }
 
 impl Fact {
@@ -28,6 +59,7 @@ impl Fact {
             label: label.into(),
             value: value.into(),
             mono: false,
+            link: None,
         }
     }
 
@@ -37,7 +69,14 @@ impl Fact {
             label: label.into(),
             value: value.into(),
             mono: true,
+            link: None,
         }
+    }
+
+    /// Make it go somewhere.
+    pub fn to(mut self, target: Target) -> Self {
+        self.link = Some(target);
+        self
     }
 }
 
@@ -73,12 +112,26 @@ pub struct Overview {
 }
 
 /// Build the Overview for an object.
-pub fn overview(kind: &str, object: &Object, now: DateTime<Utc>) -> Overview {
+///
+/// `usage` is what `metrics.k8s.io` says this object is using, when the
+/// cluster has it installed and the object is the kind that has any. `None`
+/// means the section is not drawn at all — never a row of zeroes, because a
+/// pod using no CPU and a cluster with no metrics server look identical that
+/// way and mean opposite things.
+pub fn overview(
+    kind: &str,
+    object: &Object,
+    usage: Option<&Metrics>,
+    now: DateTime<Utc>,
+) -> Overview {
     let mut sections = vec![metadata(object, now)];
+    if let Some(usage) = usage {
+        sections.push(self::usage(kind, object, usage));
+    }
     match kind {
         "Pod" => sections.extend(pod(object)),
         "Node" => sections.extend(node(object)),
-        "Deployment" | "StatefulSet" | "ReplicaSet" | "DaemonSet" => {
+        "Deployment" | "StatefulSet" | "ReplicaSet" | "DaemonSet" | "Job" => {
             sections.extend(controller(object))
         }
         "Service" => sections.extend(service(object)),
@@ -89,6 +142,56 @@ pub fn overview(kind: &str, object: &Object, now: DateTime<Utc>) -> Overview {
     Overview {
         sections,
         conditions: conditions(object),
+    }
+}
+
+/// What an object is using right now, and — for a node — what share of it
+/// that is.
+fn usage(kind: &str, object: &Object, usage: &Metrics) -> Section {
+    let mut facts = vec![
+        Fact::id(
+            "CPU",
+            share(
+                crate::time::cpu(usage.cpu_milli),
+                allocatable(kind, object, "cpu").map(|total| usage.cpu_milli as f32 / total as f32),
+            ),
+        ),
+        Fact::id(
+            "Memory",
+            share(
+                crate::time::bytes(usage.memory_bytes),
+                allocatable(kind, object, "memory")
+                    .map(|total| usage.memory_bytes as f32 / total as f32),
+            ),
+        ),
+    ];
+    facts.retain(|fact| !fact.value.is_empty());
+    Section {
+        title: Some("Using".into()),
+        facts,
+    }
+}
+
+/// A node's allocatable amount of something, in the same unit the metrics
+/// come in: milli-cores for CPU, bytes for memory.
+fn allocatable(kind: &str, object: &Object, what: &str) -> Option<u64> {
+    if kind != "Node" {
+        return None;
+    }
+    let quantity_text = object.str_at(&format!("status.allocatable.{what}"));
+    match what {
+        "cpu" => quantity::cpu_milli(quantity_text),
+        _ => quantity::bytes(quantity_text),
+    }
+    .filter(|total| *total > 0)
+}
+
+/// `143m` on its own, or `143m · 4% of allocatable` when there is something
+/// to be a share of.
+fn share(value: String, fraction: Option<f32>) -> String {
+    match fraction {
+        Some(fraction) => format!("{value}  ·  {}% of allocatable", (fraction * 100.0).round()),
+        None => value,
     }
 }
 
@@ -103,10 +206,17 @@ fn metadata(object: &Object, now: DateTime<Utc>) -> Section {
         crate::time::age(object.meta.created, now),
     ));
     if let Some(owner) = object.meta.controller() {
-        facts.push(Fact::id(
-            "Controlled by",
-            format!("{}/{}", owner.kind, owner.name),
-        ));
+        // Up: from a pod to the thing that made it, which is the single most
+        // common move in a cluster viewer.
+        facts.push(
+            Fact::id("Controlled by", format!("{}/{}", owner.kind, owner.name)).to(
+                Target::Object {
+                    key: owner.key(),
+                    namespace: object.meta.namespace.clone(),
+                    name: owner.name.clone(),
+                },
+            ),
+        );
     }
     if !object.meta.labels.is_empty() {
         facts.push(Fact::id("Labels", pairs(&object.meta.labels)));
@@ -120,7 +230,16 @@ fn metadata(object: &Object, now: DateTime<Utc>) -> Section {
 fn pod(object: &Object) -> Vec<Section> {
     let mut sections = Vec::new();
     let mut facts = Vec::new();
-    push_id(&mut facts, "Node", object.str_at("spec.nodeName"));
+    let node = object.str_at("spec.nodeName");
+    if !node.is_empty() {
+        facts.push(Fact::id("Node", node).to(Target::Object {
+            key: ResourceKey::new("", "Node"),
+            // Nodes are cluster-scoped: carrying the pod's namespace along
+            // would ask for a node inside it, which does not exist.
+            namespace: None,
+            name: node.to_string(),
+        }));
+    }
     push_id(&mut facts, "Pod IP", object.str_at("status.podIP"));
     push_id(&mut facts, "Host IP", object.str_at("status.hostIP"));
     push_text(&mut facts, "QoS class", object.str_at("status.qosClass"));
@@ -265,7 +384,16 @@ fn controller(object: &Object) -> Vec<Section> {
                 .join(", ")
         })
         .unwrap_or_default();
-    push_id(&mut facts, "Selector", &selector);
+    // Down: the selector, as a way to the pods it selects. Answered the way a
+    // person would answer it — by putting the selector in the filter box —
+    // rather than by asking the apiserver a question it has no endpoint for.
+    if !selector.is_empty() {
+        facts.push(Fact::id("Selector", selector.clone()).to(Target::Filtered {
+            key: ResourceKey::new("", "Pod"),
+            namespace: object.meta.namespace.clone(),
+            query: first_label(&selector),
+        }));
+    }
     let images = object
         .array_at("spec.template.spec.containers")
         .iter()
@@ -318,7 +446,13 @@ fn service(object: &Object) -> Vec<Section> {
                 .join(", ")
         })
         .unwrap_or_default();
-    push_id(&mut facts, "Selector", &selector);
+    if !selector.is_empty() {
+        facts.push(Fact::id("Selector", selector.clone()).to(Target::Filtered {
+            key: ResourceKey::new("", "Pod"),
+            namespace: object.meta.namespace.clone(),
+            query: first_label(&selector),
+        }));
+    }
     vec![Section {
         title: Some("Service".into()),
         facts,
@@ -438,6 +572,21 @@ fn is_negative(kind: &str) -> bool {
         || kind == "Failure"
 }
 
+/// The first `key=value` of a rendered selector.
+///
+/// The filter box is one fuzzy query, not a selector engine, so a selector of
+/// several labels has to become one of them. The first is the one a person
+/// would have typed: `app=api` narrows a namespace to a handful, and adding
+/// `tier=backend` to it narrows nothing further in practice.
+fn first_label(selector: &str) -> String {
+    selector
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 fn push_text(facts: &mut Vec<Fact>, label: &str, value: &str) {
     if !value.is_empty() {
         facts.push(Fact::text(label, value));
@@ -493,6 +642,7 @@ mod tests {
                 json!({"metadata": {"name": "web", "namespace": "shop", "uid": "u",
                                         "creationTimestamp": "2026-09-07T09:00:00Z"}}),
             ),
+            None,
             now(),
         );
         assert_eq!(overview.sections.len(), 1);
@@ -521,6 +671,7 @@ mod tests {
                                 "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
                            ]}
             })),
+            None,
             now(),
         );
         let facts = facts(&overview);
@@ -545,6 +696,7 @@ mod tests {
                            "capacity": {"cpu": "4", "memory": "8Gi"},
                            "allocatable": {"cpu": "3800m", "memory": "7.5Gi"}}
             })),
+            None,
             now(),
         );
         let facts = facts(&overview);
@@ -561,6 +713,7 @@ mod tests {
                 "type": "Opaque",
                 "data": {"password": "aHVudGVyMg==", "username": "cm9vdA=="}
             })),
+            None,
             now(),
         );
         let facts = facts(&overview);
@@ -570,6 +723,188 @@ mod tests {
             !facts.iter().any(|(_, value)| value.contains("aHVudGVyMg")),
             "a secret's value must not reach the panel"
         );
+    }
+
+    fn linked<'a>(overview: &'a Overview, label: &str) -> &'a Fact {
+        overview
+            .sections
+            .iter()
+            .flat_map(|section| section.facts.iter())
+            .find(|fact| fact.label == label)
+            .unwrap_or_else(|| panic!("no fact called {label}"))
+    }
+
+    #[test]
+    fn a_pod_points_up_at_what_made_it() {
+        let overview = overview(
+            "Pod",
+            &object(json!({
+                "metadata": {"name": "api-7d9f8c-2xk", "namespace": "shop",
+                             "ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet",
+                                                  "name": "api-7d9f8c", "uid": "rs",
+                                                  "controller": true}]},
+                "spec": {"nodeName": "node-1", "containers": [{"name": "api"}]}
+            })),
+            None,
+            now(),
+        );
+        assert_eq!(
+            linked(&overview, "Controlled by").link,
+            Some(Target::Object {
+                key: ResourceKey::new("apps", "ReplicaSet"),
+                namespace: Some("shop".into()),
+                name: "api-7d9f8c".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_pods_node_is_a_link_and_carries_no_namespace() {
+        // Nodes are cluster-scoped: asking for one inside the pod's namespace
+        // would be asking for something that does not exist.
+        let overview = overview(
+            "Pod",
+            &object(json!({
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {"nodeName": "node-1", "containers": [{"name": "api"}]}
+            })),
+            None,
+            now(),
+        );
+        assert_eq!(
+            linked(&overview, "Node").link,
+            Some(Target::Object {
+                key: ResourceKey::new("", "Node"),
+                namespace: None,
+                name: "node-1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_controller_points_down_at_the_pods_it_selects() {
+        let overview = overview(
+            "Deployment",
+            &object(json!({
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {"selector": {"matchLabels": {"app": "api", "tier": "backend"}},
+                         "template": {"spec": {"containers": [{"name": "api", "image": "x:1"}]}}}
+            })),
+            None,
+            now(),
+        );
+        assert_eq!(
+            linked(&overview, "Selector").link,
+            Some(Target::Filtered {
+                key: ResourceKey::new("", "Pod"),
+                namespace: Some("shop".into()),
+                query: "app=api".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_service_points_at_its_pods_the_same_way() {
+        let overview = overview(
+            "Service",
+            &object(json!({
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {"type": "ClusterIP", "selector": {"app": "api"}}
+            })),
+            None,
+            now(),
+        );
+        assert!(matches!(
+            linked(&overview, "Selector").link,
+            Some(Target::Filtered { .. })
+        ));
+    }
+
+    #[test]
+    fn a_selector_of_several_labels_becomes_the_first_one() {
+        // The filter box is one fuzzy query, not a selector engine.
+        assert_eq!(first_label("app=api, tier=backend"), "app=api");
+        assert_eq!(first_label("app=api"), "app=api");
+        assert_eq!(first_label(""), "");
+    }
+
+    #[test]
+    fn a_cluster_with_no_metrics_gets_no_usage_section_rather_than_a_row_of_zeroes() {
+        // A pod using no CPU and a cluster with no metrics server look
+        // identical as zeroes and mean opposite things.
+        let overview = overview(
+            "Pod",
+            &object(json!({"metadata": {"name": "p"}})),
+            None,
+            now(),
+        );
+        assert!(
+            !overview
+                .sections
+                .iter()
+                .any(|section| section.title.as_deref() == Some("Using"))
+        );
+    }
+
+    #[test]
+    fn a_pod_says_what_it_is_using() {
+        let usage = Metrics {
+            name: "api".into(),
+            namespace: Some("shop".into()),
+            cpu_milli: 143,
+            memory_bytes: 268_435_456,
+        };
+        let overview = overview(
+            "Pod",
+            &object(json!({"metadata": {"name": "api", "namespace": "shop"}})),
+            Some(&usage),
+            now(),
+        );
+        assert_eq!(linked(&overview, "CPU").value, "143m");
+        assert_eq!(linked(&overview, "Memory").value, "256Mi");
+    }
+
+    #[test]
+    fn a_node_says_what_share_of_itself_that_is() {
+        let usage = Metrics {
+            name: "node-1".into(),
+            namespace: None,
+            cpu_milli: 1900,
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+        };
+        let overview = overview(
+            "Node",
+            &object(json!({
+                "metadata": {"name": "node-1"},
+                "status": {"allocatable": {"cpu": "3800m", "memory": "8Gi"},
+                           "capacity": {"cpu": "4", "memory": "8Gi"}}
+            })),
+            Some(&usage),
+            now(),
+        );
+        assert!(
+            linked(&overview, "CPU").value.contains("50%"),
+            "{}",
+            linked(&overview, "CPU").value
+        );
+        assert!(linked(&overview, "Memory").value.contains("50%"));
+    }
+
+    #[test]
+    fn a_node_with_nothing_allocatable_reports_the_number_without_a_share() {
+        let usage = Metrics {
+            name: "node-1".into(),
+            namespace: None,
+            cpu_milli: 100,
+            memory_bytes: 1024,
+        };
+        let overview = overview(
+            "Node",
+            &object(json!({"metadata": {"name": "node-1"}})),
+            Some(&usage),
+            now(),
+        );
+        assert_eq!(linked(&overview, "CPU").value, "100m");
     }
 
     #[test]
@@ -603,6 +938,7 @@ mod tests {
         let overview = overview(
             "ConfigMap",
             &object(json!({"metadata": {"name": "c"}})),
+            None,
             now(),
         );
         assert_eq!(overview.sections.len(), 1);
