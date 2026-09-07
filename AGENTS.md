@@ -16,11 +16,11 @@ It is the third window in a family that becomes one application: **Ginka** (codi
 
 ## Current state
 
-**M0 and M1 have landed; M2 is mostly landed.** The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns, a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
+**M0, M1 and M2 have landed; M3 is under way.** The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns, a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
 
 **The table is live.** The list on screen — and only that one — is followed: a thread reads the watch, bookmarks keep the resume point moving, a `410 Gone` re-lists, a dropped connection backs off, and only the rows whose objects actually moved are formatted again. `KIRIKUMO_DEMO=1` has a scripted watch, so the whole path can be exercised without a cluster.
 
-What is *not* there yet: `⌘K`, metrics, owner/child navigation, log follow, and no writes at all. See `docs/roadmap.md` §5.
+`⌘K` reaches every kind, namespace, context and command by name. What is *not* there yet: metrics, owner/child navigation, log follow, and no writes at all. See `docs/roadmap.md` §5.
 
 ## Commands
 
@@ -28,6 +28,7 @@ What is *not* there yet: `⌘K`, metrics, owner/child navigation, log follow, an
 cargo run                                   # the desktop app, on the current context
 cargo run --release
 KIRIKUMO_DEMO=1 cargo run                   # the same window over a scripted cluster, no network
+KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_PALETTE=1 cargo run   # ...opened on the palette, for screenshots
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all

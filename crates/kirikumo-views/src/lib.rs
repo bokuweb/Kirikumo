@@ -16,6 +16,7 @@
 rust_i18n::i18n!("../../locales", fallback = "en");
 
 pub mod detail;
+pub mod palette;
 pub mod shell;
 pub mod sidebar;
 pub mod skeleton;
@@ -30,4 +31,5 @@ use gpui::App;
 /// Bind the keys the views answer to. Call once, after `gpui_component::init`.
 pub fn init(cx: &mut App) {
     shell::init(cx);
+    palette::init(cx);
 }

@@ -201,17 +201,18 @@ Before writing a widget, check `gpui-component`'s gallery for an existing one.
 - **One table draws every kind**, virtualized, with `kubectl get`'s columns per kind and Name/Namespace/Age for everything else, a health mark per row, sortable headings, a namespace picker and a fuzzy filter over every cell and label.
 - The **detail panel** has Overview (per-kind facts plus conditions), Events, YAML (rendered locally from the object already on screen) and, for anything with containers, Logs with a container picker.
 - **The table is live.** The list on screen — and only that one — is watched: a thread reads the stream, bookmarks keep the resume point moving while nothing happens, a `410 Gone` re-lists and starts again, and a dropped connection backs off from a second to thirty. A change reaches the row without anybody pressing refresh, and only the rows whose objects moved are formatted again.
+- **`⌘K` reaches everything by name** — every kind, every namespace, every context, and the four commands that are none of those — ranked by score, and holding nothing that can destroy anything.
 - **Switching context** rebuilds the connection and clears everything the last cluster said. An insecure connection says so in the sidebar.
 - **English and Japanese.** Every user-visible string is in `locales/app.yml` in both.
 - `KIRIKUMO_DEMO=1` runs the whole window over a scripted cluster with something wrong in it, and no network — including a scripted *watch*, so the demo shows a pod restarting, one arriving and one going away without a cluster anywhere.
 
-What is *not* there yet: `⌘K`, metrics, owner/child navigation, log follow, and every write.
+What is *not* there yet: metrics, owner/child navigation, log follow, and every write.
 
 | # | Name | What lands | Owes |
 | --- | --- | --- | --- |
 | **M0** | The window | Workspace, tokens, locales, the three-column shell with no title bar, kubeconfig parsing, context list, `/version` handshake, `Scripted` and `KIRIKUMO_DEMO=1` | **Landed.** Visual sign-off against `docs/ui.md` |
 | **M1** | Everything is a table | API discovery, the resource tree in the sidebar, one virtualized table for every kind with `kubectl`'s columns, the namespace picker, health marks, the detail's Overview, Events, YAML and Logs | **Landed.** Column sets beyond the built-in kinds — see Q5, which may make that debt disappear rather than be paid; sticky header under scroll |
-| **M2** | Live | Watches wired to the store with bookmarks and re-list, rows updated in place rather than rebuilt, `⌘F`/`⌘L`/`⌘K` | **Mostly landed.** `⌘K`; backoff tuning against a real flaky apiserver rather than a scripted one |
+| **M2** | Live | Watches wired to the store with bookmarks and re-list, rows updated in place rather than rebuilt, `⌘F`/`⌘L`/`⌘K` | **Landed.** Backoff tuning against a real flaky apiserver rather than a scripted one |
 | **M3** | Pods in depth | Logs *following*, with wrap, find and the previous instance (the container picker and a tail landed in M1), `metrics.k8s.io` for nodes and pods, owner/child navigation (a Deployment's ReplicaSets and their Pods) | |
 | **M4** | Acting | Delete, scale, restart, cordon/uncordon/drain, apply an edited YAML — each behind a confirmation, each greyed out when `SelfSubjectAccessReview` says no (K6) | |
 | **M5** | In Ginka's window | `ClusterPanel` mounted as a surface, the `Cluster` implementation that proxies through Ginka's daemon, and exec/port-forward over WebSocket if Q2 says yes | |

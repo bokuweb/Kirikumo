@@ -85,6 +85,46 @@ impl Filter {
             })
             .collect()
     }
+
+    /// Score a set of strings and return the matches, best first.
+    ///
+    /// The opposite policy to [`Self::indices`], and deliberately so. A table
+    /// is read down a column, so filtering it must not reorder it. A palette
+    /// is read from the top, so it must: the whole value of typing three
+    /// letters is that the thing you meant is the first row.
+    ///
+    /// An empty query returns everything in the order it was given, which is
+    /// the order [`crate::palette::entries`] chose.
+    pub fn rank(&mut self, query: &str, haystacks: &[String]) -> Vec<usize> {
+        let query = query.trim();
+        if query.is_empty() {
+            return (0..haystacks.len()).collect();
+        }
+        let pattern = Pattern::new(
+            query,
+            CaseMatching::Ignore,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        let mut buffer = Vec::new();
+        let mut scored: Vec<(usize, u32)> = haystacks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, haystack)| {
+                buffer.clear();
+                let haystack = nucleo_matcher::Utf32Str::new(haystack, &mut buffer);
+                pattern
+                    .score(haystack, &mut self.matcher)
+                    .map(|score| (index, score))
+            })
+            .collect();
+        // Best first, and ties in the order they were given, so a list that
+        // scores flat does not shuffle between keystrokes.
+        scored.sort_by(|(left_index, left), (right_index, right)| {
+            right.cmp(left).then(left_index.cmp(right_index))
+        });
+        scored.into_iter().map(|(index, _)| index).collect()
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +247,49 @@ mod tests {
         let mut filter = Filter::new();
         assert!(filter.apply("zzzzzz", &rows).is_empty());
         assert!(filter.indices("zzzzzz", &rows).is_empty());
+    }
+
+    #[test]
+    fn ranking_puts_the_thing_you_meant_first() {
+        let mut filter = Filter::new();
+        let haystacks: Vec<String> = [
+            "deployments workloads",
+            "pods workloads",
+            "podsecuritypolicies config",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let ranked = filter.rank("pods", &haystacks);
+        assert_eq!(ranked.first(), Some(&1));
+    }
+
+    #[test]
+    fn an_empty_query_leaves_the_palette_in_the_order_it_was_built() {
+        let mut filter = Filter::new();
+        let haystacks: Vec<String> = ["c", "a", "b"].into_iter().map(str::to_string).collect();
+        assert_eq!(filter.rank("", &haystacks), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn ties_keep_the_order_they_were_given_so_the_list_does_not_shuffle() {
+        let mut filter = Filter::new();
+        let haystacks: Vec<String> = ["shop one", "shop two", "shop three"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let ranked = filter.rank("shop", &haystacks);
+        assert_eq!(ranked, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn ranking_drops_what_does_not_match_at_all() {
+        let mut filter = Filter::new();
+        let haystacks: Vec<String> = ["pods", "services"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(filter.rank("zzzz", &haystacks).is_empty());
     }
 
     #[test]

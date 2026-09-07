@@ -8,6 +8,7 @@
 //! would mount it.
 
 use crate::detail::Detail;
+use crate::palette::{Palette, PaletteEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::store::Store;
 use crate::table::{ResourceTable, TableEvent};
@@ -18,6 +19,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, InteractiveElementExt as _, StyledExt as _, h_flex, v_flex};
 use kirikumo_kube::{Cluster, KubeConfig, ResourceKey, Rest, Scripted};
 use kirikumo_ui::assets::icon;
+use kirikumo_ui::palette::{Action, Command, Here};
 use kirikumo_ui::settings::{self, AppSettings};
 use kirikumo_ui::{HEADER_HEIGHT, Layout, Mode, Panel, Paths, TRAFFIC_LIGHT_INSET, Tokens, nav};
 use std::sync::Arc;
@@ -30,7 +32,8 @@ actions!(
         ToggleRightPanel,
         Refresh,
         FocusFilter,
-        PickContext
+        PickContext,
+        TogglePalette
     ]
 );
 
@@ -85,6 +88,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-l", PickContext, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-l", PickContext, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k", TogglePalette, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-k", TogglePalette, Some(CONTEXT)),
     ]);
 }
 
@@ -106,6 +113,12 @@ pub struct Shell {
     namespace_filter: Entity<InputState>,
     /// Whether the namespace picker is open.
     picking_namespace: bool,
+    /// Everything reachable by name. `⌘K`.
+    palette: Entity<Palette>,
+    /// Whether it is open.
+    showing_palette: bool,
+    /// The palette was asked for before there was a window to open it in.
+    open_palette_pending: bool,
     /// The appearance changed and the theme has to be installed at the next
     /// frame, which is the first place with a window to ask.
     retheme: bool,
@@ -154,8 +167,17 @@ impl Shell {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), window, cx));
         let table = cx.new(|cx| ResourceTable::new(store.clone(), cx));
         let detail = cx.new(|cx| Detail::new(store.clone(), cx));
+        let palette = cx.new(|cx| Palette::new(store.clone(), window, cx));
 
         let mut subscriptions = Vec::new();
+        subscriptions.push(cx.subscribe(&palette, |this, _, event, cx| match event {
+            PaletteEvent::Chose(action) => {
+                let action = action.clone();
+                this.close_palette(cx);
+                this.act(action, cx);
+            }
+            PaletteEvent::Dismissed => this.close_palette(cx),
+        }));
         subscriptions.push(cx.subscribe(&sidebar, |this, _, event, cx| match event {
             SidebarEvent::Pick(key) => this.show_kind(key.clone(), cx),
             SidebarEvent::SwitchContext(name) => this.switch_context(name.clone(), cx),
@@ -230,6 +252,9 @@ impl Shell {
             filter,
             namespace_filter,
             picking_namespace: false,
+            palette,
+            showing_palette: false,
+            open_palette_pending: false,
             retheme: false,
             resizing: None,
             transitions: Vec::new(),
@@ -519,6 +544,65 @@ impl Shell {
         let handle = self.filter.read(cx).focus_handle(cx);
         handle.focus(window, cx);
         cx.notify();
+    }
+
+    /// Open the palette as soon as the window is up.
+    ///
+    /// For demos and screenshots (`KIRIKUMO_DEMO_PALETTE=1`): a native window
+    /// cannot be driven from a script the way a page can, and a screenshot of
+    /// the palette is worth an environment variable.
+    pub fn open_palette_at_launch(&mut self, cx: &mut Context<Self>) {
+        self.open_palette_pending = true;
+        cx.notify();
+    }
+
+    /// `⌘K`: open the palette, or close it if it is already open.
+    fn on_toggle_palette(
+        &mut self,
+        _: &TogglePalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.showing_palette {
+            self.close_palette(cx);
+            return;
+        }
+        let here = Here {
+            kind: self.table.read(cx).kind().cloned(),
+            namespace: self.table.read(cx).namespace().map(str::to_string),
+            context: self.store.read(cx).current_context().map(str::to_string),
+        };
+        self.showing_palette = true;
+        self.palette
+            .update(cx, |palette, cx| palette.open(here, window, cx));
+        cx.notify();
+    }
+
+    /// Close the palette and take focus back, so the shell's own chords work
+    /// again the moment it is gone.
+    fn close_palette(&mut self, cx: &mut Context<Self>) {
+        self.showing_palette = false;
+        cx.notify();
+    }
+
+    /// Do what a palette entry asks.
+    ///
+    /// Every one of these is something a control on screen already does; the
+    /// palette is a second way in, not a second implementation.
+    fn act(&mut self, action: Action, cx: &mut Context<Self>) {
+        match action {
+            Action::Kind(key) => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.adopt(Some(key.clone()), cx));
+                self.show_kind(key, cx);
+            }
+            Action::Namespace(namespace) => self.set_namespace(namespace, cx),
+            Action::Context(name) => self.switch_context(name, cx),
+            Action::Command(Command::Refresh) => self.refresh(cx),
+            Action::Command(Command::ToggleSidebar) => self.toggle(Panel::Sidebar, cx),
+            Action::Command(Command::ToggleRightPanel) => self.toggle(Panel::RightPanel, cx),
+            Action::Command(Command::CycleAppearance) => self.cycle_appearance(cx),
+        }
     }
 
     /// `⌘L`: open the context picker.
@@ -897,6 +981,14 @@ impl Render for Shell {
             self.retheme = false;
             self.apply_theme(window, cx);
         }
+        // Waits for discovery: opened at the first frame the palette would
+        // hold four commands and nothing else, which is a screenshot of
+        // nothing. A reader pressing ⌘K that early gets the same short list,
+        // and the next press gets the full one — it is rebuilt every time.
+        if self.open_palette_pending && self.store.read(cx).catalogue().value().is_some() {
+            self.open_palette_pending = false;
+            self.on_toggle_palette(&TogglePalette, window, cx);
+        }
         let tokens = Tokens::global(cx).clone();
         let standard = tokens.duration_ms.standard();
         let sidebar_width = self.drawn_width(Panel::Sidebar, standard, window);
@@ -923,6 +1015,37 @@ impl Render for Shell {
             sidebar_width.map(|_| self.handle(Panel::Sidebar, cx).into_any_element());
         let right_handle =
             right_width.map(|_| self.handle(Panel::RightPanel, cx).into_any_element());
+        let palette = self.showing_palette.then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                // A scrim that catches a click anywhere else: a palette that
+                // can only be closed with the keyboard is a trap for whoever
+                // opened it with the mouse.
+                .child(
+                    div()
+                        .id("palette-scrim")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .on_click(cx.listener(|this, _, _, cx| this.close_palette(cx))),
+                )
+                .child(
+                    h_flex()
+                        .absolute()
+                        .top(px(90.))
+                        .left_0()
+                        .right_0()
+                        .justify_center()
+                        .child(self.palette.clone()),
+                )
+                .into_any_element()
+        });
 
         v_flex()
             .key_context(CONTEXT)
@@ -932,6 +1055,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_focus_filter))
             .on_action(cx.listener(Self::on_pick_context))
+            .on_action(cx.listener(Self::on_toggle_palette))
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.end_resize(cx)),
@@ -965,6 +1089,9 @@ impl Render for Shell {
                 .size_0()
             }))
             .size_full()
+            // The palette hangs off this, so it has to be a positioning
+            // context.
+            .relative()
             // No background here: `Root` already paints the translucent
             // window and painting it again composites the alpha away.
             .text_color(tokens.colors().text_primary)
@@ -1038,5 +1165,6 @@ impl Render for Shell {
                             .children(right_handle)
                     })),
             )
+            .children(palette)
     }
 }

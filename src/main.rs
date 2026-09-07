@@ -104,6 +104,8 @@ fn main() -> Result<()> {
                 WindowBounds::Windowed(Bounds::centered(None, size(px(1440.), px(920.)), cx))
             }));
 
+            let open_palette =
+                std::env::var_os("KIRIKUMO_DEMO_PALETTE").is_some_and(|value| value == "1");
             cx.open_window(options, |window, cx| {
                 let shell = cx.new(|cx| {
                     kirikumo_views::Shell::new(
@@ -115,6 +117,9 @@ fn main() -> Result<()> {
                         cx,
                     )
                 });
+                if open_palette {
+                    shell.update(cx, |shell, cx| shell.open_palette_at_launch(cx));
+                }
                 cx.new(|cx| Root::new(shell, window, cx))
             })
             .expect("failed to open the main window");

@@ -99,6 +99,16 @@ Empty state: *Pick something to look at* over the glass.
 
 What the centre column is when the kubeconfig has no contexts, or the current one cannot be reached: the logo at 56 px, one sentence naming the file we looked in and what went wrong, and the context picker inline so another one can be tried. Never a modal, and never an empty window with a spinner.
 
+### 3.6 The palette — `⌘K`
+
+An overlay 90 px from the top of the window, 560 px wide, on `bg.raised` with a strong border: a field, and under it up to nine 34 px rows before the list scrolls. Everything else in the window is behind a scrim that dismisses on a click, because a palette that can only be closed with the keyboard is a trap for whoever opened it with the mouse.
+
+Each row is an icon, a title, and a muted hint at the trailing edge — the sidebar group for a kind (and its API group, for a custom resource), *Namespace*, a context's server, *Command*. Where the window already is carries the same check the pickers use.
+
+It holds every kind the cluster serves, every namespace and *All namespaces*, every context in the kubeconfig, and four commands: refresh, the two panel toggles, and the appearance. **Nothing in it is destructive**, for the same reason no key chord is (roadmap K6).
+
+It is the one list in the app **ranked by score** rather than left in its own order. A table is read down a column and must not reorder as you type; a palette is read from the top and must, because the whole value of typing three letters is that the thing you meant is the first row. ↑/↓ (and `⌃P`/`⌃N`) wrap, ⏎ chooses, `esc` dismisses. The list is rebuilt on every open, so a kind the cluster stopped serving is never offered.
+
 ## 4. Component mapping
 
 | Region | Component |
@@ -107,13 +117,14 @@ What the centre column is when the kubeconfig has no contexts, or the current on
 | Columns | ours: three flex children with explicit widths, a 9 px grab area centred on each divider, and the drag tracked at the window root |
 | Table | `gpui::uniform_list` with rows from `kirikumo_ui::table::Row`, our own header |
 | Pickers (context, namespace) | ours: a filter `Input` over a `uniform_list` in a `bg.raised` popover |
+| Palette | ours: the same, as a centred overlay over a click-to-dismiss scrim |
 | Filter box, log find | `gpui-component` `Input` |
 | YAML, logs | `gpui::uniform_list` of mono lines |
 | Tooltips, icons | `gpui-component` primitives; our SVGs in `assets/icons/` for what the toolkit lacks |
 
 ## 5. Interaction rules
 
-- `⌘B` sidebar, `⌘⌥B` right panel, `⌘R` refresh what is on screen, `⌘F` the filter box, `⌘L` the context picker. `⌘K`, the command palette, is still to come.
+- `⌘B` sidebar, `⌘⌥B` right panel, `⌘R` refresh what is on screen, `⌘F` the filter box, `⌘L` the context picker, `⌘K` the palette.
 - **No destructive action has a key chord.** Nothing bound to a key may delete, scale or evict (roadmap K6).
 - Picking a row opens it on the right and never navigates the centre away.
 - Never block: a fetch or a re-list shows the stale table until the fresh one lands.

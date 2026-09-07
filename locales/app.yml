@@ -97,6 +97,16 @@ table.rows:
   en: "%{shown} of %{total}"
   ja: "%{total} 件中 %{shown} 件"
 
+palette.placeholder:
+  en: Go to a kind, a namespace, a cluster…
+  ja: リソース・Namespace・クラスタへ移動…
+palette.command:
+  en: Command
+  ja: コマンド
+palette.empty:
+  en: Nothing matches that
+  ja: 一致するものがありません
+
 detail.empty:
   en: Pick something to look at
   ja: 表示するものを選んでください
