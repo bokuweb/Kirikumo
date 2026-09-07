@@ -1,0 +1,75 @@
+[package]
+name = "kirikumo"
+version = "0.0.0"
+edition = "2024"
+description = "A native Kubernetes viewer, built to stand alone and to be embedded in Ginka"
+publish = false
+
+[workspace]
+members = [
+    "crates/kirikumo-kube",
+    "crates/kirikumo-ui",
+    "crates/kirikumo-views",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+kirikumo-kube = { path = "crates/kirikumo-kube" }
+kirikumo-ui = { path = "crates/kirikumo-ui" }
+kirikumo-views = { path = "crates/kirikumo-views" }
+
+# GPUI arrives transitively through gpui-component: the component library owns
+# the rev, and pinning it independently guarantees a conflict on the next
+# toolkit upgrade. The lock file pins both to the revs Ginka and e1 are built
+# against, which is what lets `kirikumo-views` be mounted in Ginka's window
+# (docs/roadmap.md §4.3): two revs of `gpui` are two unrelated sets of types.
+gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+# The matcher for the resource filter: small, pure Rust, the one Helix and Zed
+# use, and the one Ginka and e1 already match paths with.
+nucleo-matcher = "0.3"
+rust-i18n = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# A kubeconfig is YAML, so a parser is not optional. `serde_norway` is the
+# maintained fork of the unmaintained `serde_yaml`; the API is the same.
+serde_norway = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Blocking HTTPS over rustls, run on GPUI's background executor, with the
+# client certificates and private roots a kubeconfig hands us. Chosen over an
+# async client because every async client on crates.io brings tokio, and Ginka
+# runs on smol: a second reactor in the embedding process is the one thing the
+# host forbids (its AGENTS.md § Conventions).
+ureq = { version = "3", features = ["json"] }
+
+[dependencies]
+kirikumo-kube.workspace = true
+kirikumo-ui.workspace = true
+kirikumo-views.workspace = true
+anyhow.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+rust-i18n.workspace = true
+tracing.workspace = true
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[lints]
+workspace = true

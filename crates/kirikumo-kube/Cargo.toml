@@ -1,0 +1,24 @@
+[package]
+name = "kirikumo-kube"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Kubernetes domain: kubeconfig, discovery, the data model, the client trait, its REST implementation and a scripted fake"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

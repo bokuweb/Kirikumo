@@ -1,0 +1,97 @@
+# AGENTS.md
+
+Guidance for AI coding agents (and humans) working in this repository.
+
+## What this project is
+
+**Kirikumo is a native Kubernetes viewer, written in Rust on GPUI, built to stand on its own and to be mounted inside [Ginka](https://github.com/bokuweb/ginka).**
+
+It shows what a person opens Lens for — what is running, what is unhealthy, what did that pod log, what does this object actually look like — over any cluster their kubeconfig can reach, with nothing installed in the cluster and no account anywhere.
+
+It is the third window in a family that becomes one application: **Ginka** (coding agents) is the host, **[e1](https://github.com/bokuweb/e1)** (GitHub) is a surface in it, and Kirikumo is another. Every interface decision here is made for the embedded case as well as the standalone one; the six constraints that follow from that are `docs/roadmap.md` §4.3, as K1–K6.
+
+**Read [`docs/roadmap.md`](docs/roadmap.md) before starting any non-trivial work.** It holds the architecture, the crate layout, the data model, the embedding contract, the milestone plan and the decision log. This file is the short version; the roadmap is authoritative.
+
+**For anything that renders, read [`docs/ui.md`](docs/ui.md) too.** It holds the layout, the design tokens and the region-by-region breakdown.
+
+## Current state
+
+**M0 and M1 have landed; M2 is under way.** The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns, a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
+
+What is *not* there yet: the watches are written and tested (`kirikumo_kube::watch`) but nothing subscribes to them, so the table is refreshed rather than live; there are no metrics, no owner/child navigation, no log follow, and no writes at all. See `docs/roadmap.md` §5.
+
+## Commands
+
+```bash
+cargo run                                   # the desktop app, on the current context
+cargo run --release
+KIRIKUMO_DEMO=1 cargo run                   # the same window over a scripted cluster, no network
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+cargo test -p kirikumo-kube -p kirikumo-ui  # the fast loop: no GPUI build
+```
+
+On a volume without native extended attributes macOS drops `._*` sidecar files next to every file written; `rust-i18n` reads every file in `locales/`, so delete them (`find . -name '._*' -not -path './target/*' -delete`) before a build that fails on `locales/._app.yml`.
+
+The kubeconfig is looked for in this order: `KIRIKUMO_KUBECONFIG`, then `KUBECONFIG` (a `:`-separated list, merged first-wins), then `~/.kube/config`. `KIRIKUMO_HOME` overrides `~/.kirikumo`, which holds settings and logs and nothing else; `KIRIKUMO_LOG` sets the tracing filter.
+
+## Layout
+
+```
+kirikumo/
+├─ Cargo.toml           # workspace root; the `kirikumo` binary lives here and is deliberately thin
+├─ src/main.rs          # opens the window, mounts kirikumo-views::Shell
+├─ crates/
+│  ├─ kirikumo-kube/    # domain: kubeconfig, auth, discovery, the object model,
+│  │                    # health, the `Cluster` trait, the REST client, watches,
+│  │                    # and the scripted fake. No GPUI.
+│  ├─ kirikumo-ui/      # design tokens, assets, settings, layout, the sidebar
+│  │                    # tree, the table's columns -- everything UI-side that is
+│  │                    # testable without a window
+│  └─ kirikumo-views/   # the GPUI views, as a library a host window can mount
+├─ locales/app.yml      # every user-visible string, en and ja side by side
+├─ assets/themes/       # design tokens (dark.json, light.json), Ginka's own files
+├─ assets/icons/        # app-owned icons, layered over the toolkit's set
+└─ docs/
+```
+
+## Architectural rules
+
+These are load-bearing. Each one exists so that Ginka can mount these views; violating one creates work that has to be undone at unification.
+
+1. **The views are a library.** Everything that draws lives in `kirikumo-views`, and `src/main.rs` only opens a window and hands it a `Shell`. A view that only exists in the binary is a view Ginka cannot mount.
+2. **A cluster is reached through the `Cluster` trait, never directly.** Views hold an `Arc<dyn Cluster>` and nothing else knows about HTTP. Ginka's daemon owns all state in that app, so when embedded the implementation it supplies will proxy through the daemon — which is only possible if no view has a private path to the network.
+3. **No second reactor.** HTTP is blocking (`ureq`) and runs on GPUI's background executor; a watch is a blocking read on a thread of its own. Ginka runs on `smol` and forbids a second async runtime in its process, which is also why `kube-rs` is not a dependency (roadmap §8).
+4. **One toolkit, at Ginka's rev.** `gpui-component` is the only linked UI library and it owns the `gpui` rev; `Cargo.lock` pins both to what Ginka's and e1's locks pin. Two revs of `gpui` are two unrelated sets of types. Never pin `gpui` directly.
+5. **Tokens by name, and the same names as Ginka.** No view hardcodes a colour, radius or duration; `assets/themes/*.json` is Ginka's file unchanged.
+6. **Domain logic belongs in `kirikumo-kube` or `kirikumo-ui`, not in `kirikumo-views`.** If it can be tested without a window, it must live where it can be tested without a window. This is also a compiler constraint: `rustc` overflows its stack expanding `#[test]` in a crate that also holds the toolkit's builder chains, so `kirikumo-views` carries no tests at all.
+7. **Long lists are virtualized from the first commit.** The table, the YAML view and the log view are each one `uniform_list`; a namespace with four thousand pods must not cost four thousand elements.
+8. **Nothing is typed per kind that can be read generically.** An object is JSON plus its `ObjectMeta`; a column set, a health rule and a detail section are functions of that JSON. This is what makes a CRD free, and it is the reason there is no code generation here.
+9. **Read-only by default, and no write without two deliberate gestures — the second naming the object.** No destructive action is reachable from a key chord. This app acts on production and will one day share a key map with two apps that do not.
+10. **Nothing about a cluster is written to disk.** No response cache, no snapshot, no credential. Settings are the only thing this app writes.
+
+## UI stack
+
+- **Linked:** [`gpui-component`](https://github.com/longbridge/gpui-component) — resizable panels, virtualized lists, inputs, tooltips, markdown.
+- **Reference, not a dependency:** Ginka's `src/` and e1's `crates/e1-views/` for how the frameless three-column window is assembled. Read for the mechanism, rebuilt here against our own types.
+- **Read for behaviour, never copied:** Lens for the shape of the resource tree and the object drawer, k9s for what a row is worth, Headlamp for generic-first rendering, `kubectl` for the wire. Take the requirement away from the reading and implement it here.
+- Before writing a widget, check `gpui-component`'s gallery for an existing one.
+
+## Conventions
+
+- **Rust edition 2024.** `cargo fmt` and `cargo clippy -D warnings` must pass; CI enforces both.
+- **Errors:** `anyhow` at binary boundaries, typed errors (`thiserror`) inside `kirikumo-kube`.
+- **Tests:** test-first for anything with a decision in it — kubeconfig merging and its precedence, exec credential expiry, discovery's preferred-version rule, a Pod's health when a container is in `CrashLoopBackOff` but the phase still says `Running`, `kubectl`'s age formatting, watch framing and `410 Gone`. Cluster behaviour is tested against `kirikumo_kube::Scripted`, never against a live apiserver.
+- **i18n:** user-visible strings go through `rust-i18n`. `en` and `ja` are both maintained.
+- **a11y is a rule, not a polish pass.** Every control reachable by mouse is reachable by keyboard with visible focus; health is an icon *and* a colour, never a colour alone.
+- **English in the repository.** Code, comments, docs, commit messages and pull requests are written in English, no matter what language the conversation that produced them was in.
+- **Commits and pull requests:** imperative subject, explain *why* in the body. Reference the roadmap milestone when the change advances one.
+- **Comments are rustdoc.** Every public item carries a `///` comment; every crate and module root carries a `//!` header saying what lives there and what it owns. Document what a caller must know — invariants, errors, units, the constraint that made the code look the way it does — not what the signature already says.
+
+## Working agreements for agents
+
+- When a change alters architecture, data model, or scope, **update `docs/roadmap.md` in the same change**, including the decision log at the bottom. When it alters layout, tokens or component choices, update `docs/ui.md`.
+- Do not silently expand scope. The milestone ordering and the §3.2 non-goals are deliberate.
+- When something here diverges from how Ginka or e1 does the same thing, say why in the decision log — divergence is what unification pays for.
+- Keep this file and `CLAUDE.md` truthful. If you add commands, add them here once they actually work.

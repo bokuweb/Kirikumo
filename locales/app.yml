@@ -1,0 +1,152 @@
+# Every user-visible string in Kirikumo, in both languages it ships with.
+#
+# `_version: 2` keeps the languages side by side so a missing translation is
+# visible in review rather than in a running window. Keys are namespaced by
+# the region of the UI they belong to.
+_version: 2
+
+app.name:
+  en: Kirikumo
+  ja: Kirikumo
+
+panel.sidebar:
+  en: Sidebar
+  ja: サイドバー
+panel.right:
+  en: Details
+  ja: 詳細
+
+# The sidebar's groups. The order is Lens's, because it is the order people
+# already know (docs/ui.md §3.2).
+group.cluster:
+  en: Cluster
+  ja: クラスタ
+group.workloads:
+  en: Workloads
+  ja: ワークロード
+group.config:
+  en: Config
+  ja: 設定
+group.network:
+  en: Network
+  ja: ネットワーク
+group.storage:
+  en: Storage
+  ja: ストレージ
+group.access_control:
+  en: Access Control
+  ja: アクセス制御
+group.custom:
+  en: Custom Resources
+  ja: カスタムリソース
+
+sidebar.no_cluster:
+  en: No cluster
+  ja: クラスタ未接続
+sidebar.loading_catalogue:
+  en: Asking the cluster what it serves…
+  ja: クラスタの API を確認しています…
+sidebar.insecure:
+  en: "Certificate verification is off for %{server}"
+  ja: "%{server} の証明書検証は無効です"
+sidebar.objects:
+  en: "%{count} objects"
+  ja: "%{count} 件"
+sidebar.appearance:
+  en: Appearance
+  ja: 外観
+
+context.switch:
+  en: Switch cluster
+  ja: クラスタを切り替え
+context.placeholder:
+  en: Filter contexts
+  ja: コンテキストを絞り込む
+context.empty:
+  en: No contexts in the kubeconfig
+  ja: kubeconfig にコンテキストがありません
+
+table.filter:
+  en: Filter
+  ja: 絞り込み
+table.all_namespaces:
+  en: All namespaces
+  ja: すべての Namespace
+table.namespace:
+  en: Namespace
+  ja: Namespace
+table.namespace_placeholder:
+  en: Filter namespaces
+  ja: Namespace を絞り込む
+table.empty:
+  en: Nothing here
+  ja: 何もありません
+table.no_matches:
+  en: Nothing matches that
+  ja: 一致するものがありません
+table.pick_a_kind:
+  en: Pick something in the sidebar
+  ja: サイドバーから選択してください
+table.refresh:
+  en: Refresh
+  ja: 再読み込み
+table.rows:
+  en: "%{shown} of %{total}"
+  ja: "%{total} 件中 %{shown} 件"
+
+detail.empty:
+  en: Pick something to look at
+  ja: 表示するものを選んでください
+detail.overview:
+  en: Overview
+  ja: 概要
+detail.events:
+  en: Events
+  ja: イベント
+detail.yaml:
+  en: YAML
+  ja: YAML
+detail.logs:
+  en: Logs
+  ja: ログ
+detail.conditions:
+  en: Conditions
+  ja: 状態
+detail.events_empty:
+  en: No events
+  ja: イベントはありません
+detail.logs_empty:
+  en: This container has said nothing
+  ja: このコンテナの出力はありません
+detail.container:
+  en: Container
+  ja: コンテナ
+
+welcome.title:
+  en: No cluster
+  ja: クラスタがありません
+welcome.body:
+  en: Kirikumo reads the clusters your kubeconfig can reach. None were found.
+  ja: Kirikumo は kubeconfig に書かれたクラスタを表示します。見つかりませんでした。
+welcome.looked_in:
+  en: "Looked in %{path}"
+  ja: "確認した場所: %{path}"
+
+error.no_context:
+  en: No kubeconfig context was found. Set KUBECONFIG, or write ~/.kube/config.
+  ja: kubeconfig のコンテキストが見つかりません。KUBECONFIG を設定するか ~/.kube/config を用意してください。
+error.kubeconfig:
+  en: "The kubeconfig could not be read: %{detail}"
+  ja: "kubeconfig を読み込めませんでした: %{detail}"
+error.credentials:
+  en: "Could not produce credentials: %{detail}"
+  ja: "認証情報を取得できませんでした: %{detail}"
+error.forbidden:
+  en: "Not allowed: %{detail}"
+  ja: "権限がありません: %{detail}"
+error.unsupported:
+  en: This cluster does not offer that.
+  ja: このクラスタでは利用できません。
+error.failed:
+  en: "Could not reach the cluster: %{detail}"
+  ja: "クラスタに接続できませんでした: %{detail}"

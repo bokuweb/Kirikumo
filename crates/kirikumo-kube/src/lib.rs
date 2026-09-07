@@ -1,0 +1,131 @@
+//! The Kubernetes domain: everything about clusters that does not draw.
+//!
+//! What lives here: reading and merging a kubeconfig ([`kubeconfig`]), turning
+//! a context into credentials that survive rotation ([`auth`]), asking an
+//! apiserver what it serves ([`discovery`]), the generic object model
+//! ([`model`]), the rule that turns an object into a health mark
+//! ([`health`]), quantity parsing ([`quantity`]), the [`Cluster`] trait every
+//! view reaches a cluster through, its REST implementation ([`rest`]), the
+//! framing of a watch ([`watch`]), and a scripted fake ([`scripted`]).
+//!
+//! What does not live here: anything that knows a colour, a column or a
+//! window. This crate has no `gpui` dependency and never will
+//! (`AGENTS.md` rule 6).
+//!
+//! Two constraints shape all of it. Objects are `serde_json::Value` plus a
+//! parsed [`ObjectMeta`], never generated types, so a custom resource costs
+//! nothing (rule 8). And every call is *blocking* and `Send + Sync`, because
+//! the host that will one day own this window runs on `smol` and forbids a
+//! second async runtime (rule 3).
+
+pub mod auth;
+pub mod discovery;
+pub mod error;
+pub mod health;
+pub mod kubeconfig;
+pub mod model;
+pub mod quantity;
+pub mod rest;
+pub mod scripted;
+pub mod watch;
+pub mod yaml;
+
+pub use error::{Error, Result};
+pub use health::{Health, Level};
+pub use kubeconfig::{KubeConfig, kubeconfig_paths};
+pub use model::{
+    ApiResource, Catalogue, ClusterVersion, ContextRef, EventRecord, Group, LogRequest, Metrics,
+    Object, ObjectList, ObjectMeta, OwnerRef, Patch, ResourceKey,
+};
+pub use rest::Rest;
+pub use scripted::Scripted;
+pub use watch::{WatchEvent, WatchStream};
+
+/// Everything a view may ask of a cluster.
+///
+/// The one path from a view to the network (`AGENTS.md` rule 2). Blocking and
+/// `Send + Sync` on purpose: the standalone app calls it on GPUI's background
+/// executor, and the host that will mount these views implements it over its
+/// own RPC with a `block_on`. An async trait would fix the executor for both.
+///
+/// Every method a cluster might not offer — metrics, watches, writes — has a
+/// default that answers [`Error::Unsupported`], so a partial implementation
+/// still compiles and a cluster that refuses degrades to a viewer rather than
+/// to an error page.
+pub trait Cluster: Send + Sync {
+    /// What the apiserver says it is.
+    fn version(&self) -> Result<ClusterVersion>;
+
+    /// Everything the cluster serves, one preferred version per kind.
+    fn catalogue(&self) -> Result<Catalogue>;
+
+    /// Every namespace, for the namespace picker.
+    fn namespaces(&self) -> Result<Vec<String>>;
+
+    /// Every object of one kind, in one namespace or across all of them.
+    ///
+    /// `namespace` is ignored for cluster-scoped resources.
+    fn list(&self, resource: &ApiResource, namespace: Option<&str>) -> Result<ObjectList>;
+
+    /// One object.
+    fn get(&self, resource: &ApiResource, namespace: Option<&str>, name: &str) -> Result<Object>;
+
+    /// The events an object is involved in, newest first.
+    fn events_for(&self, uid: &str, namespace: Option<&str>) -> Result<Vec<EventRecord>>;
+
+    /// A container's log, as text.
+    fn logs(&self, request: &LogRequest) -> Result<String>;
+
+    /// Node resource use, when `metrics.k8s.io` is installed.
+    fn node_metrics(&self) -> Result<Vec<Metrics>> {
+        Err(Error::Unsupported)
+    }
+
+    /// Pod resource use, when `metrics.k8s.io` is installed.
+    fn pod_metrics(&self, _namespace: Option<&str>) -> Result<Vec<Metrics>> {
+        Err(Error::Unsupported)
+    }
+
+    /// Follow a kind from a known `resourceVersion`.
+    ///
+    /// The stream is read on a thread of its own; see [`watch`] for the
+    /// framing and for what a `410 Gone` means.
+    fn watch(
+        &self,
+        _resource: &ApiResource,
+        _namespace: Option<&str>,
+        _from: &str,
+    ) -> Result<Box<dyn WatchStream>> {
+        Err(Error::Unsupported)
+    }
+
+    /// Delete one object. A write: see `AGENTS.md` rule 9.
+    fn delete(&self, _resource: &ApiResource, _namespace: Option<&str>, _name: &str) -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    /// Patch one object. A write: see `AGENTS.md` rule 9.
+    fn patch(
+        &self,
+        _resource: &ApiResource,
+        _namespace: Option<&str>,
+        _name: &str,
+        _patch: Patch,
+    ) -> Result<Object> {
+        Err(Error::Unsupported)
+    }
+
+    /// Whether this client may do something, per `SelfSubjectAccessReview`.
+    ///
+    /// Answering `false` greys a control out rather than letting the reader
+    /// press it and read a 403. An implementation that cannot ask says `true`
+    /// and lets the apiserver be the judge.
+    fn can_i(
+        &self,
+        _resource: &ApiResource,
+        _namespace: Option<&str>,
+        _verb: &str,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+}

@@ -1,0 +1,125 @@
+# Kirikumo UI Specification
+
+> Companion to [`roadmap.md`](roadmap.md). The roadmap says *what* we build and when; this document says *what it looks like* and *which components render it*. Where this document is silent, Ginka's `docs/ui.md` applies: the window, the tokens and the header strips are the same by design (roadmap §4.3, K5).
+> Last updated: 2026-09-07
+
+## 1. Design direction
+
+The same three-column workstation as Ginka and e1, on the same dark glass:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ ●●●  ⬓        │ Pods · default            [all namespaces ▾] ⌕      ⟳  ⬓        │
+├───────────────┼───────────────────────────────────────┼─────────────────────────┤
+│ kind-dev      │ ● NAME              READY  STATUS  ↑  │ api-7d9f8c              │
+│ v1.31.2       │ ● api-7d9f8c-2xk    2/2    Running    │ Pod · default           │
+│               │ ● api-7d9f8c-9qd    2/2    Running    │ ● Running · 2/2 ready   │
+│ Cluster       │ ▲ web-6b4c5d-lm2    1/2    Pending    │ node-1 · 10.244.1.7     │
+│  Nodes     3  │ ✕ jobrunner-xk4     0/1    Error      │ ─────────────────────── │
+│  Namespaces 6 │ ● cache-0           1/1    Running    │ [Overview][Events][YAML]│
+│  Events       │                                       │        [Logs]           │
+│               │                                       │                         │
+│ Workloads     │                                       │ Labels  app=api         │
+│  Pods      24 │                                       │ Created 3d ago          │
+│  Deployments  │                                       │ Owner   ReplicaSet …    │
+│  StatefulSets │                                       │ Containers              │
+│  ...          │                                       │  api    ghcr.io/…:1.4   │
+│               │                                       │  proxy  envoy:1.31      │
+│ Config        │                                       │                         │
+│ Network       │                                       │                         │
+│ (◐) 42 objects│                                       │                         │
+└───────────────┴───────────────────────────────────────┴─────────────────────────┘
+```
+
+The five properties of Ginka's §1 hold — glass, chromeless, density with air, ambient status, short motion — with two additions:
+
+6. **Health is a mark, not a word.** Every row opens with one 8 px mark in the status colours: a filled dot for healthy, a ring for working, a triangle for attention, a cross for failed, a hollow dot for unknown. The word is in the row too (`Running`, `CrashLoopBackOff`), because the mark is the glance and the word is the answer.
+7. **A row is a table row, not a card.** This app's centre column is `kubectl get`, and a person reading it is comparing columns down the page. One line per object, monospace for anything that is an identifier, and the columns of `kubectl get -o wide` in `kubectl`'s own order.
+
+## 2. Design tokens
+
+Identical to Ginka's `docs/ui.md` §2, from the same `assets/themes/*.json` — the same file, byte for byte, not a copy that drifts. The mapping that matters here:
+
+| Health | Token | Mark | Examples |
+| --- | --- | --- | --- |
+| `Ok` | `status.done` | filled dot | Pod `Running` and ready, Deployment at its replicas, Node `Ready` |
+| `Working` | `status.working` | ring | `Pending`, `ContainerCreating`, a rollout in progress, `Terminating` |
+| `Attention` | `status.attention` | triangle | ready < desired, a Node under pressure, an unbound PVC |
+| `Error` | `status.error` | cross | `CrashLoopBackOff`, `ImagePullBackOff`, `Failed`, `NotReady` |
+| `Unknown` | `text.muted` | hollow dot | no status to read, or a kind we have no rule for |
+
+Geometry as Ginka's: 44 px header strips, 4 px grid, row radius 9, controls at 6, sidebar 250 (200–480), right panel 420 (280–…), centre never under 320 px, dividers a 9 px grab area with a hairline in the accent under the pointer, panels sliding over 260 ms with an ease-out cubic.
+
+A table row is **28 px**, not 56: two lines per object is a reading list's shape, and this is a comparison list's. The header row is 26 px on `table_head()`, sticky.
+
+### Type
+
+The system UI font for labels and prose; **the mono family for every cell that holds an identifier** — names, images, IPs, versions, quantities — at 12 px, because a column of names that do not line up is a column that cannot be scanned. Sidebar rows and headers 13 px, metadata 11.5 px, the detail body 14 px on a 1.6 line height. Logs and YAML are mono at 12 px on a 1.45 line height.
+
+## 3. Regions
+
+### 3.1 Headers — there is no title bar
+
+As Ginka §3.1: each column paints itself to the top and carries a 44 px strip; the leading strip leaves 78 px for the traffic lights; every strip drags the window and double-clicks to zoom. The centre strip says what the table is, and carries the namespace picker, the filter box, refresh and the right-panel toggle.
+
+### 3.2 Sidebar — the cluster and its resources
+
+- **Header** — the context's name in bold and the server's version under it, muted. Clicking it opens the **context picker**: a filter field and one row per context in the kubeconfig, with the cluster's server address muted beneath each and a check on the current one. Switching drops every watch, clears the store and re-runs discovery; the window does not restart.
+- **Groups** — the resource tree, from discovery (roadmap §4.4), in Lens's order because it is the order people already know: **Cluster** (Nodes, Namespaces, Events, and anything else non-namespaced that is not in another group), **Workloads** (Pods, Deployments, DaemonSets, StatefulSets, ReplicaSets, Jobs, CronJobs), **Config** (ConfigMaps, Secrets, ResourceQuotas, LimitRanges, HPAs, PodDisruptionBudgets), **Network** (Services, Endpoints, Ingresses, IngressClasses, NetworkPolicies), **Storage** (PersistentVolumeClaims, PersistentVolumes, StorageClasses), **Access Control** (ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings), then **Custom Resources**, grouped by API group with the group as the folding heading. A group heading folds and remembers that it did, the way e1's owner headings do. A row is the kind's plural name and, once a list has landed, its count.
+- **Anything the catalogue has and these groups do not name** falls into Custom Resources under its group, which is what makes a CRD free: no row here is written in the source.
+- **Footer** — a health summary for the connection (a dot, the number of objects held, and *watching* / *reconnecting…* / the error), then the appearance control (moon, sun, or half of each), the way e1's footer carries it.
+- **Insecure clusters say so.** When the context has `insecure-skip-tls-verify`, the header carries a small `status.attention` shield with a tooltip naming the server. A viewer that hides that is worse than one that refuses.
+
+### 3.3 Centre — the table
+
+The centre strip carries the kind's name and the namespace it is scoped to, then the **namespace picker** (a chip that opens a filterable list, with *All namespaces* at the top and disabled for cluster-scoped kinds), the **filter box** (240 px, fuzzy over every cell in the row, live as it is typed), refresh, and the right-panel toggle.
+
+A `uniform_list` of 28 px rows under a sticky header:
+
+- The **health mark** in the first 16 px, then the columns for the kind. The column set is `kubectl get`'s, per kind, and for anything with no set of its own the fallback is Name, Namespace (when namespaced), and Age — which is what `kubectl` prints for a CRD too.
+- Names in mono; ages as the shortest unit that says it (`3d`, `2h17m`, `45s`), as `kubectl` writes them.
+- The header is clickable and sorts; the arrow says which way. The default is the kind's own: Age descending for Pods and Events, name ascending otherwise.
+- Selecting a row draws it in `row.active` and opens it on the right; the table never navigates away underneath.
+- **Empty, error and first load**: one muted line for empty; the error's own words in `status.error` over a kept table for a failure; a skeleton of pulsing bars in the row tint for a first load. A refresh over a table that already has rows keeps them and spins the refresh glyph — never a blank page.
+
+### 3.4 Right panel — the object
+
+Tabs under the header, as chips: **Overview**, **Events**, **YAML**, and **Logs** for anything with containers.
+
+- **Header** — the object's name at 15/500 in mono; under it the kind, the namespace, the health mark and its word. Then the actions the milestone allows, each of which takes two gestures (roadmap K6).
+- **Overview** — the rows every object has (labels, annotations behind a fold, created, owner references as links that navigate the centre column, the resourceVersion muted), then what the kind adds: a Pod's node, IPs, QoS class and its containers with images, ports, restarts and state; a Deployment's strategy, replica counts and conditions; a Service's type, cluster IP, ports and selector; a Node's capacity, allocatable, conditions and kubelet version. A condition table is the shape `kubectl describe` prints, drawn as rows with the status as a mark.
+- **Events** — the object's own events, newest first: type as a mark, reason in mono, the message, the count and the age. *No events* is one muted line, and is normal.
+- **YAML** — the object as the apiserver sends it, mono, line-numbered, in one virtualized list. Read-only until M4; at M4 an *Edit* control turns it into an editor and *Apply* takes two gestures.
+- **Logs** — the container picker as chips when there is more than one, then the lines in a virtualized list with a follow toggle (on by default, dropped the moment the reader scrolls up, restored by a *Jump to end* pill), a wrap toggle, a *previous container* toggle, and a find box that highlights and steps through matches. Timestamps are muted and off by default.
+- **Footer** — the actions strip, when the milestone has any.
+
+Empty state: *Pick something to look at* over the glass.
+
+### 3.5 No cluster
+
+What the centre column is when the kubeconfig has no contexts, or the current one cannot be reached: the logo at 56 px, one sentence naming the file we looked in and what went wrong, and the context picker inline so another one can be tried. Never a modal, and never an empty window with a spinner.
+
+## 4. Component mapping
+
+| Region | Component |
+| --- | --- |
+| Window shell | `gpui-component` `Root`, our header strips |
+| Columns | ours: three flex children with explicit widths, a 9 px grab area centred on each divider, and the drag tracked at the window root |
+| Table | `gpui::uniform_list` with rows from `kirikumo_ui::table::Row`, our own header |
+| Pickers (context, namespace) | ours: a filter `Input` over a `uniform_list` in a `bg.raised` popover |
+| Filter box, log find | `gpui-component` `Input` |
+| YAML, logs | `gpui::uniform_list` of mono lines |
+| Tooltips, icons | `gpui-component` primitives; our SVGs in `assets/icons/` for what the toolkit lacks |
+
+## 5. Interaction rules
+
+- `⌘B` sidebar, `⌘⌥B` right panel, `⌘R` refresh what is on screen. Landing in M2: `⌘F` the filter box, `⌘L` the context picker, `⌘K` the command palette.
+- **No destructive action has a key chord.** Nothing bound to a key may delete, scale or evict (roadmap K6).
+- Picking a row opens it on the right and never navigates the centre away.
+- Never block: a fetch or a re-list shows the stale table until the fresh one lands.
+- A watch's changes animate nothing. A row that changed re-renders in place; a table that reorders on every heartbeat is unreadable.
+- Truncate names from the right; truncate images from the *left*, because the tag is the part being compared.
+
+## 6. The logo
+
+`assets/icons/kirikumo.svg`: three horizontal strokes offset like drifting cloud layers, cut by one vertical, at 2.2 on the 24-grid, one colour. It is painted in `Tokens::logo()` — white on the dark theme, navy on the light one — which is not a token because no other part of the window uses it. It sits on the no-cluster screen at 56 px, and nowhere else.

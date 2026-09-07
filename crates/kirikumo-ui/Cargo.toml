@@ -1,0 +1,28 @@
+[package]
+name = "kirikumo-ui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Design tokens, assets, settings and view models: everything UI-side that is testable without a window"
+
+[dependencies]
+kirikumo-kube.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+nucleo-matcher.workspace = true
+rust-i18n.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
