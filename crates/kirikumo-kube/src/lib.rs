@@ -39,7 +39,7 @@ pub use model::{
 };
 pub use rest::Rest;
 pub use scripted::Scripted;
-pub use watch::{WatchEvent, WatchStream};
+pub use watch::{Applied, WatchEvent, WatchStream};
 
 /// Everything a view may ask of a cluster.
 ///

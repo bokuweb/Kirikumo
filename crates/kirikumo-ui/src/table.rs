@@ -15,6 +15,7 @@
 use chrono::{DateTime, Utc};
 use kirikumo_kube::{ApiResource, Health, Level, Object, health, quantity};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// How a column takes its share of the table's width.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -374,24 +375,50 @@ impl ColumnSet {
             created: object.meta.created,
             cells,
             haystack: haystack.to_lowercase(),
+            version: object.meta.resource_version.clone(),
         }
+    }
+
+    /// Rows for a whole list, reusing the ones that have not changed.
+    ///
+    /// A watch delivers one changed object at a time, and rebuilding every
+    /// row for each event is how a live table on a busy namespace becomes a
+    /// space heater: four thousand objects times seven formatted cells, tens
+    /// of times a second. An object whose `resourceVersion` has not moved
+    /// cannot have changed, so its row is carried over untouched and the only
+    /// work is a hash lookup.
+    ///
+    /// `previous` may be in any order and may hold rows for objects that have
+    /// since gone; both are ignored. The answer is always in `objects`' order
+    /// and holds exactly one row per object, so a caller sorts afterwards.
+    pub fn rows(&self, objects: &[Object], previous: &[Row], now: DateTime<Utc>) -> Vec<Row> {
+        let kept: HashMap<&str, &Row> =
+            previous.iter().map(|row| (row.key.as_str(), row)).collect();
+        objects
+            .iter()
+            .map(|object| {
+                let identity = object.meta.identity();
+                match kept.get(identity.as_str()) {
+                    // The AGE cell is the one thing that goes stale without
+                    // the object changing, so a reused row is only right
+                    // between watch events — which is exactly when it is
+                    // used. A refresh rebuilds from scratch.
+                    Some(row) if row.version == object.meta.resource_version => (*row).clone(),
+                    _ => self.row(object, now),
+                }
+            })
+            .collect()
     }
 }
 
 /// The identity of a row.
 ///
-/// The uid, because a deleted-and-recreated object with the same name is a
-/// different object and must not inherit the old one's selection. Falling
-/// back to `namespace/name` covers the answers that omit the uid, which some
-/// aggregated apiservers do.
+/// The same identity the watch matches its events by
+/// ([`kirikumo_kube::ObjectMeta::identity`]) — deliberately one function, not
+/// two, because two spellings of "the same object" is how a live table grows
+/// duplicates.
 pub fn row_key(object: &Object) -> String {
-    if !object.meta.uid.is_empty() {
-        return object.meta.uid.clone();
-    }
-    match &object.meta.namespace {
-        Some(namespace) => format!("{namespace}/{}", object.meta.name),
-        None => object.meta.name.clone(),
-    }
+    object.meta.identity()
 }
 
 /// One object as the table draws it.
@@ -414,6 +441,12 @@ pub struct Row {
     pub created: Option<DateTime<Utc>>,
     /// Every cell and label, lowercased, for the filter box.
     pub haystack: String,
+    /// The `resourceVersion` this row was built from.
+    ///
+    /// What makes a live table cheap: a watch event changes one object, and
+    /// every row whose version has not moved is reused rather than
+    /// reformatted. See [`ColumnSet::rows`].
+    pub version: String,
 }
 
 impl Row {
@@ -984,6 +1017,87 @@ mod tests {
         sort(&mut rows, &columns, restarts, true);
         let order: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(order, vec!["two", "nine", "ten"]);
+    }
+
+    #[test]
+    fn a_row_whose_object_has_not_moved_is_reused_rather_than_reformatted() {
+        let columns = ColumnSet::for_kind("Pod", true, false);
+        let object = object(json!({
+            "metadata": {"name": "api", "uid": "u1", "resourceVersion": "10"},
+            "status": {"phase": "Running", "containerStatuses": [{"ready": true}]}
+        }));
+        // A doctored row proves reuse: nothing but carrying it over could
+        // produce this cell.
+        let mut previous = columns.row(&object, now());
+        previous.cells[0] = "carried over".into();
+
+        let rows = columns.rows(std::slice::from_ref(&object), &[previous], now());
+        assert_eq!(rows[0].cells[0], "carried over");
+    }
+
+    #[test]
+    fn a_row_whose_object_changed_is_built_again() {
+        let columns = ColumnSet::for_kind("Pod", true, false);
+        let before = object(json!({
+            "metadata": {"name": "api", "uid": "u1", "resourceVersion": "10"},
+            "status": {"phase": "Running", "containerStatuses": [{"ready": true}]}
+        }));
+        let mut stale = columns.row(&before, now());
+        stale.cells[0] = "carried over".into();
+
+        let after = object(json!({
+            "metadata": {"name": "api", "uid": "u1", "resourceVersion": "11"},
+            "status": {"phase": "Running", "containerStatuses": [
+                {"ready": false, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+            ]}
+        }));
+        let rows = columns.rows(&[after], &[stale], now());
+        assert_eq!(rows[0].cells[0], "api");
+        assert_eq!(rows[0].health.level, Level::Error);
+        assert_eq!(rows[0].version, "11");
+    }
+
+    #[test]
+    fn rows_come_back_in_the_lists_order_however_the_previous_ones_were_sorted() {
+        let columns = ColumnSet::for_kind("Pod", true, false);
+        let make = |name: &str, uid: &str| {
+            object(json!({"metadata": {"name": name, "uid": uid, "resourceVersion": "1"}}))
+        };
+        let objects = vec![make("a", "1"), make("b", "2"), make("c", "3")];
+        let mut previous: Vec<Row> = objects.iter().map(|o| columns.row(o, now())).collect();
+        previous.reverse();
+        // And one row for something that has since gone away.
+        previous.push(columns.row(&make("ghost", "9"), now()));
+
+        let rows = columns.rows(&objects, &previous, now());
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_recreated_object_does_not_inherit_the_old_ones_row() {
+        let columns = ColumnSet::for_kind("Pod", true, false);
+        let old = object(json!({
+            "metadata": {"name": "api", "uid": "old", "resourceVersion": "10"}
+        }));
+        let mut stale = columns.row(&old, now());
+        stale.cells[0] = "carried over".into();
+        // Same name, same version, different uid: a different object.
+        let new = object(json!({
+            "metadata": {"name": "api", "uid": "new", "resourceVersion": "10"}
+        }));
+        let rows = columns.rows(&[new], &[stale], now());
+        assert_eq!(rows[0].cells[0], "api");
+    }
+
+    #[test]
+    fn building_rows_with_nothing_to_reuse_is_the_same_as_building_them_one_by_one() {
+        let columns = ColumnSet::for_kind("Pod", true, false);
+        let objects = vec![pod()];
+        assert_eq!(
+            columns.rows(&objects, &[], now()),
+            vec![columns.row(&objects[0], now())]
+        );
     }
 
     #[test]

@@ -12,14 +12,16 @@
 //! revalidation out of.
 
 use gpui::{AppContext as _, Context, EventEmitter};
+use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
-    ApiResource, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, LogRequest, Object,
-    ObjectList, ResourceKey,
+    ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, LogRequest,
+    Object, ObjectList, ResourceKey, WatchEvent, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Which list: a kind, scoped to a namespace or to all of them.
 pub type ListKey = (ResourceKey, Option<String>);
@@ -48,6 +50,31 @@ pub struct Store {
     lists: HashMap<ListKey, Fetch<ObjectList>>,
     events: HashMap<String, Fetch<Vec<EventRecord>>>,
     logs: HashMap<String, Fetch<String>>,
+    /// The list the window is looking at, and so the only one worth
+    /// following. A cluster with ten thousand pods must not be streamed
+    /// because the sidebar mentions pods (roadmap §4.7).
+    followed: Option<ListKey>,
+    /// The watch that is running, if one is.
+    watch: Option<WatchHandle>,
+    /// Bumped for every watch started, so an event from one that has been
+    /// abandoned is recognised and dropped.
+    generation: u64,
+}
+
+/// A watch that is running, and the way to tell it to stop.
+struct WatchHandle {
+    /// Which list it follows.
+    key: ListKey,
+    /// Which generation it belongs to.
+    generation: u64,
+    /// Set when it is abandoned.
+    ///
+    /// The reader is a blocking read on a thread of its own and cannot be
+    /// interrupted from here, so it notices at its next event or at the
+    /// apiserver's timeout — five minutes at the outside
+    /// (`kirikumo_kube::rest`). Until then it is a parked thread and a socket,
+    /// and its events are dropped by generation.
+    stop: Arc<AtomicBool>,
 }
 
 impl EventEmitter<StoreEvent> for Store {}
@@ -66,6 +93,9 @@ impl Store {
             lists: HashMap::new(),
             events: HashMap::new(),
             logs: HashMap::new(),
+            followed: None,
+            watch: None,
+            generation: 0,
         }
     }
 
@@ -127,6 +157,8 @@ impl Store {
         self.lists.clear();
         self.events.clear();
         self.logs.clear();
+        self.stop_watch();
+        self.followed = None;
         cx.emit(StoreEvent::Changed);
         cx.notify();
         self.refresh_all(cx);
@@ -201,10 +233,155 @@ impl Store {
         self.fetch(
             cx,
             move |cluster| cluster.list(&resource, scope.as_deref()),
-            move |this, result, _| {
-                this.lists.entry(stored).or_default().finish(result);
+            move |this, result, cx| {
+                let landed = result.is_ok();
+                this.lists.entry(stored.clone()).or_default().finish(result);
+                // A watch resumes from the version the list came back with,
+                // so it can only start once there is a list.
+                if landed && this.followed.as_ref() == Some(&stored) {
+                    this.start_watch(cx);
+                }
             },
         );
+    }
+
+    /// Follow one list, and stop following whatever was followed before.
+    ///
+    /// One watch at a time, because one table is on screen at a time. The
+    /// watch starts when a list for this key has landed — it resumes from
+    /// that list's `resourceVersion`, so there is nothing to resume from
+    /// before then.
+    pub fn follow(&mut self, key: Option<ListKey>, cx: &mut Context<Self>) {
+        if self.followed == key {
+            return;
+        }
+        self.stop_watch();
+        self.followed = key;
+        self.start_watch(cx);
+    }
+
+    /// Whether the list on screen is being followed rather than refreshed.
+    pub fn is_live(&self) -> bool {
+        self.watch.is_some()
+    }
+
+    /// Start a watch on the followed list, if there is one to start.
+    fn start_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.followed.clone() else {
+            return;
+        };
+        if self.watch.as_ref().is_some_and(|watch| watch.key == key) {
+            return;
+        }
+        let Some(resource) = self.resource(&key.0).cloned() else {
+            return;
+        };
+        // A cluster may serve a kind it will not let anyone follow, and RBAC
+        // may allow `list` and refuse `watch`. Either way the table stays
+        // correct; it is refreshed rather than live.
+        if !resource.supports("watch") {
+            tracing::debug!(kind = %resource.kind, "no watch for this kind");
+            return;
+        }
+        let Some(version) = self
+            .lists
+            .get(&key)
+            .and_then(Fetch::value)
+            .map(|list| list.resource_version.clone())
+            .filter(|version| !version.is_empty())
+        else {
+            return;
+        };
+
+        self.stop_watch();
+        self.generation += 1;
+        let generation = self.generation;
+        let stop = Arc::new(AtomicBool::new(false));
+        self.watch = Some(WatchHandle {
+            key: key.clone(),
+            generation,
+            stop: stop.clone(),
+        });
+
+        let (sender, receiver) = async_channel::unbounded::<WatchEvent>();
+        let cluster = self.cluster.clone();
+        let namespace = key.1.clone();
+        let kind = resource.kind.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("kirikumo-watch-{kind}"))
+            .spawn(move || pump(cluster, resource, namespace, version, stop, sender))
+        {
+            tracing::warn!(%error, %kind, "could not start a watch");
+            self.watch = None;
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = receiver.recv().await {
+                let carry_on = this
+                    .update(cx, |this, cx| this.on_watch(generation, event, cx))
+                    .unwrap_or(false);
+                if !carry_on {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Tell the running watch to stop, and stop believing it.
+    fn stop_watch(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            watch.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Apply one watch event, and say whether the watch should carry on.
+    fn on_watch(&mut self, generation: u64, event: WatchEvent, cx: &mut Context<Self>) -> bool {
+        // An event from a watch we have abandoned: its thread has not
+        // noticed yet, and its list may not even be here any more.
+        let Some(key) = self
+            .watch
+            .as_ref()
+            .filter(|watch| watch.generation == generation)
+            .map(|watch| watch.key.clone())
+        else {
+            return false;
+        };
+        let Some(list) = self.lists.get_mut(&key).and_then(Fetch::value_mut) else {
+            return false;
+        };
+        match watch::apply(list, event) {
+            applied @ (Applied::Added(_) | Applied::Changed(_) | Applied::Removed(_)) => {
+                // At `trace` rather than `debug`: one line per object per
+                // event is the right grain for diagnosing a table that will
+                // not settle, and far too much for anything else.
+                tracing::trace!(?applied, kind = %key.0.kind, "a watch event landed");
+                cx.emit(StoreEvent::Changed);
+                cx.notify();
+                true
+            }
+            // A bookmark: nothing on screen moved, and the version it left
+            // behind is the thread's business, not ours.
+            Applied::Version => true,
+            Applied::Restart => {
+                // The version we were resuming from has aged out of the
+                // apiserver's window. List again; that lands a new version
+                // and starts a new watch.
+                tracing::debug!("the watch aged out; listing again");
+                self.stop_watch();
+                self.load_list(key.0, key.1.as_deref(), cx);
+                false
+            }
+            Applied::Failed(error) => {
+                // Logged, not shown: the table is still correct, it has just
+                // stopped being live, and blanking a good list over it would
+                // be worse than the loss.
+                tracing::warn!(%error, "the watch stopped");
+                self.stop_watch();
+                false
+            }
+        }
     }
 
     /// One object out of a list that has already landed.
@@ -351,5 +528,59 @@ impl Store {
             .ok();
         })
         .detach();
+    }
+}
+
+/// One watch, read to its end on a thread of its own.
+///
+/// The retry policy lives here rather than in the store because it is about a
+/// connection, not about a window: an apiserver closes an idle watch on a
+/// timeout of its own, which is routine and reconnects at once, while a
+/// transport failure backs off (roadmap §4.7). What the store decides is the
+/// one thing a connection cannot: that a `410 Gone` means list again.
+///
+/// Returns when it is told to stop, when the channel is closed — which is
+/// what dropping the receiving task does — or when the failure is one that
+/// reconnecting cannot fix.
+fn pump(
+    cluster: Arc<dyn Cluster>,
+    resource: ApiResource,
+    namespace: Option<String>,
+    mut version: String,
+    stop: Arc<AtomicBool>,
+    sender: async_channel::Sender<WatchEvent>,
+) {
+    let mut backoff = Backoff::new();
+    while !stop.load(Ordering::Relaxed) {
+        match cluster.watch(&resource, namespace.as_deref(), &version) {
+            Ok(mut stream) => {
+                backoff.reset();
+                while let Some(event) = stream.next_event() {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // Remembered before the event is given away, so a
+                    // reconnect resumes from the last thing we saw rather
+                    // than from the list.
+                    if let Some(seen) = event.resource_version() {
+                        version = seen.to_string();
+                    }
+                    let terminal = matches!(event, WatchEvent::Failed(_));
+                    if sender.send_blocking(event).is_err() || terminal {
+                        return;
+                    }
+                }
+                // The stream ended without saying anything: the apiserver's
+                // own idle timeout. Reconnect immediately, from where we got
+                // to — this is the common case and must cost nothing.
+            }
+            Err(error) => {
+                let retry = error.is_retryable();
+                if sender.send_blocking(WatchEvent::Failed(error)).is_err() || !retry {
+                    return;
+                }
+                std::thread::sleep(backoff.next_delay());
+            }
+        }
     }
 }

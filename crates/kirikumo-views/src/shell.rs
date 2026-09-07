@@ -23,7 +23,16 @@ use kirikumo_ui::{HEADER_HEIGHT, Layout, Mode, Panel, Paths, TRAFFIC_LIGHT_INSET
 use std::sync::Arc;
 use std::time::Instant;
 
-actions!(kirikumo, [ToggleSidebar, ToggleRightPanel, Refresh]);
+actions!(
+    kirikumo,
+    [
+        ToggleSidebar,
+        ToggleRightPanel,
+        Refresh,
+        FocusFilter,
+        PickContext
+    ]
+);
 
 /// The key context the shell's chords are bound in.
 const CONTEXT: &str = "KirikumoShell";
@@ -68,6 +77,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-r", Refresh, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-r", Refresh, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-f", FocusFilter, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-f", FocusFilter, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-l", PickContext, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-l", PickContext, Some(CONTEXT)),
     ]);
 }
 
@@ -493,6 +510,28 @@ impl Shell {
         self.refresh(cx);
     }
 
+    /// `⌘F`: put the caret in the filter box.
+    ///
+    /// It also opens the sidebar's own picker's sibling — no: it only ever
+    /// moves focus, because a chord that changed what is listed as well as
+    /// where the caret is would surprise.
+    fn on_focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.filter.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// `⌘L`: open the context picker.
+    fn on_pick_context(&mut self, _: &PickContext, _: &mut Window, cx: &mut Context<Self>) {
+        // The picker lives in the sidebar, so the sidebar has to be showing.
+        if !self.layout.is_open(Panel::Sidebar) {
+            self.toggle(Panel::Sidebar, cx);
+        }
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.toggle_picker(cx));
+        cx.notify();
+    }
+
     /// A small square control in a header strip.
     fn icon_button(
         &self,
@@ -891,6 +930,8 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_right_panel))
             .on_action(cx.listener(Self::on_refresh))
+            .on_action(cx.listener(Self::on_focus_filter))
+            .on_action(cx.listener(Self::on_pick_context))
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.end_resize(cx)),

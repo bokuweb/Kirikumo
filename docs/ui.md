@@ -27,7 +27,7 @@ The same three-column workstation as Ginka and e1, on the same dark glass:
 │               │                                       │  proxy  envoy:1.31      │
 │ Config        │                                       │                         │
 │ Network       │                                       │                         │
-│ (◐) 42 objects│                                       │                         │
+│ ● watching    │                                       │                         │
 └───────────────┴───────────────────────────────────────┴─────────────────────────┘
 ```
 
@@ -67,7 +67,7 @@ As Ginka §3.1: each column paints itself to the top and carries a 44 px strip; 
 - **Header** — the context's name in bold and the server's version under it, muted. Clicking it opens the **context picker**: a filter field and one row per context in the kubeconfig, with the cluster's server address muted beneath each and a check on the current one. Switching drops every watch, clears the store and re-runs discovery; the window does not restart.
 - **Groups** — the resource tree, from discovery (roadmap §4.4), in Lens's order because it is the order people already know: **Cluster** (Nodes, Namespaces, Events, and anything else non-namespaced that is not in another group), **Workloads** (Pods, Deployments, DaemonSets, StatefulSets, ReplicaSets, Jobs, CronJobs), **Config** (ConfigMaps, Secrets, ResourceQuotas, LimitRanges, HPAs, PodDisruptionBudgets), **Network** (Services, Endpoints, Ingresses, IngressClasses, NetworkPolicies), **Storage** (PersistentVolumeClaims, PersistentVolumes, StorageClasses), **Access Control** (ServiceAccounts, Roles, RoleBindings, ClusterRoles, ClusterRoleBindings), then **Custom Resources**, grouped by API group with the group as the folding heading. A group heading folds and remembers that it did, the way e1's owner headings do. A row is the kind's plural name and, once a list has landed, its count.
 - **Anything the catalogue has and these groups do not name** falls into Custom Resources under its group, which is what makes a CRD free: no row here is written in the source.
-- **Footer** — a health summary for the connection (a dot, the number of objects held, and *watching* / *reconnecting…* / the error), then the appearance control (moon, sun, or half of each), the way e1's footer carries it.
+- **Footer** — what the connection is doing, in one line: the error if there is one, else a green dot and *watching* while the list on screen is being followed, else how many kinds the cluster serves. Then the appearance control (moon, sun, or half of each), the way e1's footer carries it.
 - **Insecure clusters say so.** When the context has `insecure-skip-tls-verify`, the header carries a small `status.attention` shield with a tooltip naming the server. A viewer that hides that is worse than one that refuses.
 
 ### 3.3 Centre — the table
@@ -113,7 +113,7 @@ What the centre column is when the kubeconfig has no contexts, or the current on
 
 ## 5. Interaction rules
 
-- `⌘B` sidebar, `⌘⌥B` right panel, `⌘R` refresh what is on screen. Landing in M2: `⌘F` the filter box, `⌘L` the context picker, `⌘K` the command palette.
+- `⌘B` sidebar, `⌘⌥B` right panel, `⌘R` refresh what is on screen, `⌘F` the filter box, `⌘L` the context picker. `⌘K`, the command palette, is still to come.
 - **No destructive action has a key chord.** Nothing bound to a key may delete, scale or evict (roadmap K6).
 - Picking a row opens it on the right and never navigates the centre away.
 - Never block: a fetch or a re-list shows the stale table until the fresh one lands.

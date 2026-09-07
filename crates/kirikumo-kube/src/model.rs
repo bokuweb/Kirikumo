@@ -375,6 +375,27 @@ impl ObjectMeta {
         self.deleted.is_some()
     }
 
+    /// What identifies this object among others of its kind.
+    ///
+    /// The uid, because a deleted-and-recreated object with the same name is
+    /// a different object: it must not inherit the old one's selection, and a
+    /// watch must not treat its `ADDED` as a modification. Falling back to
+    /// `namespace/name` covers the answers that omit the uid, which some
+    /// aggregated apiservers do.
+    ///
+    /// One function, because the table keys its rows by this and the watch
+    /// matches its events by it; two spellings of "the same object" is how a
+    /// live table grows duplicates.
+    pub fn identity(&self) -> String {
+        if !self.uid.is_empty() {
+            return self.uid.clone();
+        }
+        match &self.namespace {
+            Some(namespace) => format!("{namespace}/{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
     /// The controller that made this object, if one did.
     pub fn controller(&self) -> Option<&OwnerRef> {
         self.owners.iter().find(|owner| owner.controller)

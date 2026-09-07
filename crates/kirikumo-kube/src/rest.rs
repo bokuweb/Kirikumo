@@ -34,10 +34,14 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Kubernetes closes a watch on a timeout of its own — five minutes to an
 /// hour, jittered — and asking for a number makes the reconnect cadence ours
-/// rather than the cluster's. Half an hour is long enough that reconnects are
-/// rare and short enough that a stale connection through a load balancer is
-/// noticed.
-const WATCH_SECONDS: u32 = 1800;
+/// rather than the cluster's.
+///
+/// Five minutes, and the reason is not the reconnect: it is how long an
+/// *abandoned* watch lives. The reader is a blocking read on a thread of its
+/// own, and a thread parked in `read` cannot be interrupted from outside, so
+/// a watch that has been told to stop only notices at its next event or at
+/// this timeout. Five minutes bounds that; half an hour did not.
+const WATCH_SECONDS: u32 = 300;
 
 /// The most a single answer may be, in bytes.
 ///

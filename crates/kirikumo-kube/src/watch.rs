@@ -11,7 +11,7 @@
 //! reactor in this process to read it on (`AGENTS.md` rule 3).
 
 use crate::error::Error;
-use crate::model::Object;
+use crate::model::{Object, ObjectList};
 use serde_json::Value;
 use std::io::BufRead;
 use std::time::Duration;
@@ -140,6 +140,83 @@ pub fn parse_frame(line: &str) -> Option<WatchEvent> {
         "DELETED" => Some(WatchEvent::Deleted(object)),
         _ => None,
     }
+}
+
+/// What applying one watch event did to a list.
+///
+/// The index matters: a caller that keeps rows alongside the objects updates
+/// one of them rather than rebuilding all four thousand.
+///
+/// Not `PartialEq`, because [`Error`] is not; match on it.
+#[derive(Debug)]
+pub enum Applied {
+    /// An object appeared, at this index.
+    Added(usize),
+    /// An object was replaced, at this index.
+    Changed(usize),
+    /// An object went away, from this index.
+    Removed(usize),
+    /// Only the version a reconnect resumes from moved.
+    Version,
+    /// The watch cannot continue: list again, then start a new one from the
+    /// version the list came back with.
+    Restart,
+    /// The watch failed. [`Error::is_retryable`] says whether reconnecting is
+    /// worth trying.
+    Failed(Error),
+}
+
+/// Apply one watch event to the list it belongs to.
+///
+/// The whole of a watch's semantics, written where it can be tested without a
+/// window or an apiserver (`AGENTS.md` rule 6). Three rules are load-bearing:
+///
+/// - Objects are matched by [`crate::ObjectMeta::identity`], not by name, so
+///   a pod deleted and recreated under the same name is a new row rather than
+///   an edit of the old one.
+/// - A modification keeps the object's *position*. The table is sorted by
+///   whatever the reader clicked, and moving a row to the end on every status
+///   change would make a busy namespace unreadable.
+/// - The list's `resourceVersion` advances on every event, bookmarks
+///   included. That is the entire point of asking for bookmarks: an idle
+///   watch still tells us where to resume, so a reconnect after an hour of
+///   nothing costs no re-list.
+pub fn apply(list: &mut ObjectList, event: WatchEvent) -> Applied {
+    if let Some(version) = event.resource_version() {
+        list.resource_version = version.to_string();
+    }
+    match event {
+        WatchEvent::Added(object) | WatchEvent::Modified(object) => match position(list, &object) {
+            Some(index) => {
+                list.items[index] = object;
+                Applied::Changed(index)
+            }
+            None => {
+                list.items.push(object);
+                Applied::Added(list.items.len() - 1)
+            }
+        },
+        WatchEvent::Deleted(object) => match position(list, &object) {
+            Some(index) => {
+                list.items.remove(index);
+                Applied::Removed(index)
+            }
+            // A delete for something we never had. Normal after a re-list,
+            // and nothing to do about it.
+            None => Applied::Version,
+        },
+        WatchEvent::Bookmark(_) => Applied::Version,
+        WatchEvent::Failed(Error::Gone) => Applied::Restart,
+        WatchEvent::Failed(error) => Applied::Failed(error),
+    }
+}
+
+/// Where an object already sits in a list, if it does.
+fn position(list: &ObjectList, object: &Object) -> Option<usize> {
+    let identity = object.meta.identity();
+    list.items
+        .iter()
+        .position(|held| held.meta.identity() == identity)
 }
 
 /// How long to wait before trying a dropped watch again.
@@ -279,6 +356,138 @@ mod tests {
             parse_frame(r#"{"type":"ADDED","object":{"kind":"Pod","metadata":{"name":"a"}}}"#)
                 .unwrap();
         assert_eq!(versionless.resource_version(), None);
+    }
+
+    fn list(names: &[(&str, &str)]) -> ObjectList {
+        ObjectList {
+            items: names
+                .iter()
+                .map(|(name, uid)| {
+                    Object::new(serde_json::json!({
+                        "metadata": {"name": name, "uid": uid, "resourceVersion": "1"}
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+            resource_version: "1".into(),
+            next: None,
+        }
+    }
+
+    fn object(name: &str, uid: &str, version: &str) -> Object {
+        Object::new(serde_json::json!({
+            "metadata": {"name": name, "uid": uid, "resourceVersion": version}
+        }))
+        .unwrap()
+    }
+
+    fn names(list: &ObjectList) -> Vec<&str> {
+        list.items.iter().map(|o| o.meta.name.as_str()).collect()
+    }
+
+    #[test]
+    fn an_addition_lands_at_the_end_and_advances_the_version() {
+        let mut list = list(&[("a", "1"), ("b", "2")]);
+        let applied = apply(&mut list, WatchEvent::Added(object("c", "3", "12")));
+        assert!(matches!(applied, Applied::Added(2)));
+        assert_eq!(names(&list), vec!["a", "b", "c"]);
+        assert_eq!(list.resource_version, "12");
+    }
+
+    #[test]
+    fn a_modification_keeps_the_objects_position() {
+        // The table is sorted by whatever the reader clicked; a row that
+        // jumped to the end on every status change would be unreadable.
+        let mut list = list(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        let applied = apply(&mut list, WatchEvent::Modified(object("b", "2", "20")));
+        assert!(matches!(applied, Applied::Changed(1)));
+        assert_eq!(names(&list), vec!["a", "b", "c"]);
+        assert_eq!(list.items[1].meta.resource_version, "20");
+    }
+
+    #[test]
+    fn a_deletion_removes_it() {
+        let mut list = list(&[("a", "1"), ("b", "2")]);
+        let applied = apply(&mut list, WatchEvent::Deleted(object("a", "1", "30")));
+        assert!(matches!(applied, Applied::Removed(0)));
+        assert_eq!(names(&list), vec!["b"]);
+        assert_eq!(list.resource_version, "30");
+    }
+
+    #[test]
+    fn a_deletion_for_something_we_never_had_is_harmless() {
+        let mut list = list(&[("a", "1")]);
+        let applied = apply(&mut list, WatchEvent::Deleted(object("gone", "9", "31")));
+        assert!(matches!(applied, Applied::Version));
+        assert_eq!(names(&list), vec!["a"]);
+        assert_eq!(list.resource_version, "31");
+    }
+
+    #[test]
+    fn a_pod_recreated_under_the_same_name_is_a_new_row_and_not_an_edit() {
+        // Matched by uid, not by name: a Deployment rolling a pod out reuses
+        // names all day, and treating the new one as an edit of the old would
+        // hide the restart.
+        let mut list = list(&[("api", "old")]);
+        let applied = apply(&mut list, WatchEvent::Added(object("api", "new", "40")));
+        assert!(matches!(applied, Applied::Added(1)));
+        assert_eq!(list.items.len(), 2);
+    }
+
+    #[test]
+    fn an_object_with_no_uid_falls_back_to_where_it_lives() {
+        let mut list = ObjectList {
+            items: vec![
+                Object::new(serde_json::json!({
+                    "metadata": {"name": "a", "namespace": "one"}
+                }))
+                .unwrap(),
+            ],
+            resource_version: "1".into(),
+            next: None,
+        };
+        let same = Object::new(serde_json::json!({
+            "metadata": {"name": "a", "namespace": "one", "resourceVersion": "2"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            apply(&mut list, WatchEvent::Modified(same)),
+            Applied::Changed(0)
+        ));
+        let elsewhere = Object::new(serde_json::json!({
+            "metadata": {"name": "a", "namespace": "two"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            apply(&mut list, WatchEvent::Added(elsewhere)),
+            Applied::Added(1)
+        ));
+    }
+
+    #[test]
+    fn a_bookmark_moves_only_the_version_and_that_is_the_whole_point() {
+        // An idle watch still says where to resume, so a reconnect after an
+        // hour of nothing costs no re-list.
+        let mut list = list(&[("a", "1")]);
+        let applied = apply(&mut list, WatchEvent::Bookmark("9912".into()));
+        assert!(matches!(applied, Applied::Version));
+        assert_eq!(list.resource_version, "9912");
+        assert_eq!(list.items.len(), 1);
+    }
+
+    #[test]
+    fn a_gone_asks_for_a_relist_and_anything_else_is_reported_as_it_is() {
+        let mut list = list(&[("a", "1")]);
+        assert!(matches!(
+            apply(&mut list, WatchEvent::Failed(Error::Gone)),
+            Applied::Restart
+        ));
+        assert!(matches!(
+            apply(&mut list, WatchEvent::Failed(Error::Forbidden("no".into()))),
+            Applied::Failed(Error::Forbidden(_))
+        ));
+        // Neither touched the objects.
+        assert_eq!(list.items.len(), 1);
     }
 
     #[test]

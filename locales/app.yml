@@ -49,9 +49,12 @@ sidebar.loading_catalogue:
 sidebar.insecure:
   en: "Certificate verification is off for %{server}"
   ja: "%{server} の証明書検証は無効です"
-sidebar.objects:
-  en: "%{count} objects"
-  ja: "%{count} 件"
+sidebar.kinds:
+  en: "%{count} kinds"
+  ja: "%{count} 種類"
+sidebar.watching:
+  en: watching
+  ja: 監視中
 sidebar.appearance:
   en: Appearance
   ja: 外観

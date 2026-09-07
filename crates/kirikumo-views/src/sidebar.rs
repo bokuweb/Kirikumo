@@ -72,6 +72,12 @@ impl Sidebar {
         }
     }
 
+    /// Open or close the context picker. `⌘L`, from the shell.
+    pub fn toggle_picker(&mut self, cx: &mut Context<Self>) {
+        self.picking = !self.picking;
+        cx.notify();
+    }
+
     /// Highlight a kind without emitting, which is how the shell restores a
     /// selection the settings remembered.
     pub fn adopt(&mut self, key: Option<ResourceKey>, cx: &mut Context<Self>) {
@@ -456,13 +462,18 @@ impl Sidebar {
             .value()
             .map(|catalogue| catalogue.resources.len())
             .unwrap_or_default();
-        let summary: SharedString = match store.catalogue().error() {
-            Some(error) => error.to_string().into(),
-            None => rust_i18n::t!("sidebar.objects", count = held)
+        // What the connection is doing, in one line: what went wrong, or that
+        // the list on screen is being followed, or how much the cluster
+        // serves (`docs/ui.md` §3.2).
+        let summary: SharedString = match (store.catalogue().error(), store.is_live()) {
+            (Some(error), _) => error.to_string().into(),
+            (None, true) => rust_i18n::t!("sidebar.watching").to_string().into(),
+            (None, false) => rust_i18n::t!("sidebar.kinds", count = held)
                 .to_string()
                 .into(),
         };
         let failed = store.catalogue().error().is_some();
+        let live = store.is_live();
 
         h_flex()
             .w_full()
@@ -472,6 +483,14 @@ impl Sidebar {
             .items_center()
             .border_t_1()
             .border_color(tokens.colors().border_subtle)
+            .when(live, |this| {
+                this.child(
+                    Icon::empty()
+                        .path(icon::HEALTH_OK)
+                        .size(px(6.))
+                        .text_color(tokens.colors().status_done),
+                )
+            })
             .child(
                 div()
                     .flex_1()

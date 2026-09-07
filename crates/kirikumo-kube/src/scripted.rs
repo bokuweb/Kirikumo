@@ -15,10 +15,12 @@ use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
     ResourceKey,
 };
+use crate::watch::{WatchEvent, WatchStream};
 use crate::{Cluster, discovery};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::time::Duration as Wait;
 
 /// An in-memory cluster.
 pub struct Scripted {
@@ -31,6 +33,9 @@ pub struct Scripted {
     node_metrics: Vec<Metrics>,
     pod_metrics: Vec<Metrics>,
     logs: String,
+    /// How long the scripted watch waits between events. Real seconds in a
+    /// demo, zero in a test.
+    watch_delay: Wait,
 }
 
 impl Scripted {
@@ -48,7 +53,14 @@ impl Scripted {
             node_metrics: Vec::new(),
             pod_metrics: Vec::new(),
             logs: String::new(),
+            watch_delay: Wait::ZERO,
         }
+    }
+
+    /// How long the scripted watch waits between events.
+    pub fn with_watch_delay(mut self, delay: Wait) -> Self {
+        self.watch_delay = delay;
+        self
     }
 
     /// A small cluster with something wrong in it.
@@ -369,6 +381,9 @@ impl Scripted {
                 },
             ],
             logs: SAMPLE_LOG.to_string(),
+            // Slow enough to watch happen, quick enough to see within a
+            // minute of opening the window.
+            watch_delay: Wait::from_secs(3),
         }
     }
 
@@ -442,6 +457,22 @@ impl Cluster for Scripted {
             true => Err(Error::Unsupported),
             false => Ok(self.node_metrics.clone()),
         }
+    }
+
+    fn watch(
+        &self,
+        resource: &ApiResource,
+        namespace: Option<&str>,
+        _from: &str,
+    ) -> Result<Box<dyn WatchStream>> {
+        if self.catalogue.get(&resource.key()).is_none() {
+            return Err(Error::NotFound(resource.kind.clone()));
+        }
+        Ok(Box::new(ScriptedWatch::new(
+            &resource.kind,
+            namespace.map(str::to_string),
+            self.watch_delay,
+        )))
     }
 
     fn pod_metrics(&self, namespace: Option<&str>) -> Result<Vec<Metrics>> {
@@ -600,6 +631,107 @@ fn deployment(name: &str, namespace: &str, replicas: i64, ready: i64, created: &
     })
 }
 
+/// A watch over the scripted cluster.
+///
+/// Exists for two reasons. It is the only way to exercise the whole live path
+/// — thread, channel, `watch::apply`, row reuse — without an apiserver. And
+/// it makes `KIRIKUMO_DEMO=1` demonstrate what the app is *for*: a pod
+/// restarting, one appearing, one going away, without anybody pressing
+/// refresh.
+///
+/// After its script it sends a bookmark for ever. That is not filler: it is
+/// what a real idle watch does, and it is what keeps the reading thread
+/// parked in `next_event`, which is where a stop flag can reach it.
+pub struct ScriptedWatch {
+    /// Which kind is being followed; only pods have a script.
+    kind: String,
+    /// The namespace the table is scoped to, so an event lands in it.
+    namespace: Option<String>,
+    /// How far through the script we are.
+    step: usize,
+    /// How long to wait before each event.
+    delay: Wait,
+    /// The version handed out with the last event.
+    version: u64,
+}
+
+impl ScriptedWatch {
+    /// A watch on a kind.
+    pub fn new(kind: &str, namespace: Option<String>, delay: Wait) -> Self {
+        Self {
+            kind: kind.to_string(),
+            namespace,
+            step: 0,
+            delay,
+            version: 1000,
+        }
+    }
+
+    /// The namespace a scripted pod lives in: the table's, or the one the
+    /// sample puts its interesting pods in.
+    fn namespace(&self) -> String {
+        self.namespace.clone().unwrap_or_else(|| "shop".to_string())
+    }
+}
+
+impl WatchStream for ScriptedWatch {
+    fn next_event(&mut self) -> Option<WatchEvent> {
+        std::thread::sleep(self.delay);
+        self.step += 1;
+        self.version += 1;
+        let version = self.version.to_string();
+        let namespace = self.namespace();
+        if self.kind != "Pod" {
+            return Some(WatchEvent::Bookmark(version));
+        }
+        let now = Utc::now().to_rfc3339();
+        let at = |mut value: Value| {
+            value["metadata"]["resourceVersion"] = json!(version);
+            Object::new(value).expect("the script is well formed")
+        };
+        match self.step {
+            // The crash loop gets worse, which is what a person watching this
+            // table is watching for.
+            1 => Some(WatchEvent::Modified(at(pod_waiting(
+                "jobrunner-xk4qq",
+                &namespace,
+                "node-3",
+                "CrashLoopBackOff",
+                18,
+                &now,
+            )))),
+            // A new pod is scheduled…
+            2 => Some(WatchEvent::Added(at(pod_waiting(
+                "web-6b4c5d-nn7kq",
+                &namespace,
+                "node-1",
+                "ContainerCreating",
+                0,
+                &now,
+            )))),
+            // …and comes up.
+            3 => Some(WatchEvent::Modified(at(pod_running(
+                "web-6b4c5d-nn7kq",
+                &namespace,
+                "node-1",
+                2,
+                2,
+                &now,
+            )))),
+            // The one that could not pull its image is given up on.
+            4 => Some(WatchEvent::Deleted(at(pod_waiting(
+                "importer-9j2dd",
+                &namespace,
+                "node-3",
+                "ImagePullBackOff",
+                0,
+                &now,
+            )))),
+            _ => Some(WatchEvent::Bookmark(version)),
+        }
+    }
+}
+
 /// A few lines that look like something, for the Logs tab.
 const SAMPLE_LOG: &str = "\
 2026-09-07T09:14:02.118Z INFO  starting, version=1.4.0 commit=9f2c1ab
@@ -718,8 +850,89 @@ mod tests {
             Err(Error::Unsupported)
         ));
         assert!(matches!(
-            cluster.watch(&pods, None, "1"),
+            cluster.patch(
+                &pods,
+                Some("shop"),
+                "api-7d9f8c-2xk4t",
+                crate::Patch::Merge(json!({}))
+            ),
             Err(Error::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn the_scripted_watch_makes_the_sample_change_under_the_reader() {
+        use crate::watch::{Applied, apply};
+        let cluster = Scripted::sample().with_watch_delay(std::time::Duration::ZERO);
+        let pods = resource_for(&cluster, "", "Pod");
+        let mut list = cluster.list(&pods, Some("shop")).unwrap();
+        let before = list.items.len();
+        let mut stream = cluster
+            .watch(&pods, Some("shop"), &list.resource_version)
+            .unwrap();
+
+        // The crash loop gets worse, in place.
+        let restarted = stream.next_event().unwrap();
+        assert!(matches!(apply(&mut list, restarted), Applied::Changed(_)));
+        let jobrunner = list
+            .items
+            .iter()
+            .find(|pod| pod.meta.name == "jobrunner-xk4qq")
+            .unwrap();
+        assert_eq!(health::restarts(jobrunner), 18);
+
+        // One appears…
+        assert!(matches!(
+            apply(&mut list, stream.next_event().unwrap()),
+            Applied::Added(_)
+        ));
+        assert_eq!(list.items.len(), before + 1);
+        // …and comes up where it already was, rather than moving.
+        assert!(matches!(
+            apply(&mut list, stream.next_event().unwrap()),
+            Applied::Changed(_)
+        ));
+        assert_eq!(
+            health::of("Pod", list.items.last().unwrap()).level,
+            Level::Ok
+        );
+        // One goes away.
+        assert!(matches!(
+            apply(&mut list, stream.next_event().unwrap()),
+            Applied::Removed(_)
+        ));
+        assert_eq!(list.items.len(), before);
+        assert!(
+            !list
+                .items
+                .iter()
+                .any(|pod| pod.meta.name == "importer-9j2dd")
+        );
+    }
+
+    #[test]
+    fn an_idle_scripted_watch_keeps_saying_where_to_resume() {
+        let cluster = Scripted::sample().with_watch_delay(std::time::Duration::ZERO);
+        let configmaps = resource_for(&cluster, "", "ConfigMap");
+        let mut stream = cluster.watch(&configmaps, None, "1").unwrap();
+        let mut versions = Vec::new();
+        for _ in 0..3 {
+            let event = stream.next_event().unwrap();
+            assert!(matches!(event, WatchEvent::Bookmark(_)));
+            versions.push(event.resource_version().unwrap().to_string());
+        }
+        // Each bookmark moves the version on, which is what makes a reconnect
+        // after an idle hour free.
+        assert!(versions[0] < versions[1] && versions[1] < versions[2]);
+    }
+
+    #[test]
+    fn a_kind_the_cluster_does_not_serve_cannot_be_watched() {
+        let cluster = Scripted::sample();
+        let absent = resource("example.com", "v1", "Nothing", "nothings", true);
+        assert!(matches!(
+            cluster.watch(&absent, None, "1"),
+            Err(Error::NotFound(_))
         ));
     }
 

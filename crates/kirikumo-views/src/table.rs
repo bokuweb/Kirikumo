@@ -111,10 +111,7 @@ impl ResourceTable {
             self.kind = Some(kind.clone());
             self.recolumn(cx);
         }
-        let namespace = self.namespace.clone();
-        self.store.update(cx, |store, cx| {
-            store.ensure_list(kind, namespace.as_deref(), cx)
-        });
+        self.ask(cx);
         self.rebuild(cx);
     }
 
@@ -125,7 +122,24 @@ impl ResourceTable {
         self.selected = None;
         self.rows.clear();
         self.visible.clear();
+        self.store.update(cx, |store, cx| store.follow(None, cx));
         cx.notify();
+    }
+
+    /// Ask for the list on screen, and follow it.
+    ///
+    /// The two go together: what the table is showing is what is worth
+    /// watching, and nothing else is (roadmap §4.7).
+    fn ask(&mut self, cx: &mut Context<Self>) {
+        let Some(kind) = self.kind.clone() else {
+            return;
+        };
+        let namespace = self.namespace.clone();
+        self.store.update(cx, |store, cx| {
+            let followed = store.list_key(&kind, namespace.as_deref());
+            store.ensure_list(kind, namespace.as_deref(), cx);
+            store.follow(Some(followed), cx);
+        });
     }
 
     /// Scope the table to a namespace, or to every one.
@@ -135,12 +149,7 @@ impl ResourceTable {
         }
         self.namespace = namespace;
         self.recolumn(cx);
-        if let Some(kind) = self.kind.clone() {
-            let namespace = self.namespace.clone();
-            self.store.update(cx, |store, cx| {
-                store.ensure_list(kind, namespace.as_deref(), cx)
-            });
-        }
+        self.ask(cx);
         self.rebuild(cx);
     }
 
@@ -189,16 +198,16 @@ impl ResourceTable {
             self.recolumn(cx);
         }
         let now = Utc::now();
+        // Taken rather than borrowed, so the rows that survive can be moved
+        // into the new set instead of being formatted again: a watch event
+        // changes one object, and reformatting four thousand rows for it is
+        // what makes a live table expensive (`kirikumo_ui::ColumnSet::rows`).
+        let previous = std::mem::take(&mut self.rows);
         let store = self.store.read(cx);
         self.rows = store
             .list(&kind, self.namespace.as_deref())
             .and_then(|list| list.value())
-            .map(|list| {
-                list.items
-                    .iter()
-                    .map(|object| self.columns.row(object, now))
-                    .collect()
-            })
+            .map(|list| self.columns.rows(&list.items, &previous, now))
             .unwrap_or_default();
         let (column, ascending) = self.sort;
         table::sort(&mut self.rows, &self.columns, column, ascending);

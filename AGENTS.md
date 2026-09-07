@@ -16,9 +16,11 @@ It is the third window in a family that becomes one application: **Ginka** (codi
 
 ## Current state
 
-**M0 and M1 have landed; M2 is under way.** The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns, a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
+**M0 and M1 have landed; M2 is mostly landed.** The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns, a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
 
-What is *not* there yet: the watches are written and tested (`kirikumo_kube::watch`) but nothing subscribes to them, so the table is refreshed rather than live; there are no metrics, no owner/child navigation, no log follow, and no writes at all. See `docs/roadmap.md` §5.
+**The table is live.** The list on screen — and only that one — is followed: a thread reads the watch, bookmarks keep the resume point moving, a `410 Gone` re-lists, a dropped connection backs off, and only the rows whose objects actually moved are formatted again. `KIRIKUMO_DEMO=1` has a scripted watch, so the whole path can be exercised without a cluster.
+
+What is *not* there yet: `⌘K`, metrics, owner/child navigation, log follow, and no writes at all. See `docs/roadmap.md` §5.
 
 ## Commands
 
@@ -62,7 +64,7 @@ These are load-bearing. Each one exists so that Ginka can mount these views; vio
 
 1. **The views are a library.** Everything that draws lives in `kirikumo-views`, and `src/main.rs` only opens a window and hands it a `Shell`. A view that only exists in the binary is a view Ginka cannot mount.
 2. **A cluster is reached through the `Cluster` trait, never directly.** Views hold an `Arc<dyn Cluster>` and nothing else knows about HTTP. Ginka's daemon owns all state in that app, so when embedded the implementation it supplies will proxy through the daemon — which is only possible if no view has a private path to the network.
-3. **No second reactor.** HTTP is blocking (`ureq`) and runs on GPUI's background executor; a watch is a blocking read on a thread of its own. Ginka runs on `smol` and forbids a second async runtime in its process, which is also why `kube-rs` is not a dependency (roadmap §8).
+3. **One reactor by default, and any second one is sealed behind `Cluster`.** HTTP is blocking (`ureq`) and runs on GPUI's background executor; a watch is a blocking read on a thread of its own; there is no tokio in the graph. Ginka's rule is that a second runtime needs an entry in its decision log, not that it is banned — so adding one is a decision to record in `docs/roadmap.md` §8, and it must live inside a `Cluster` implementation, because a `hyper` future polled from `smol` panics at run time rather than failing to compile. This is why `kube-rs` is not a dependency *today* and why the question is asked again at M5 (roadmap Q2).
 4. **One toolkit, at Ginka's rev.** `gpui-component` is the only linked UI library and it owns the `gpui` rev; `Cargo.lock` pins both to what Ginka's and e1's locks pin. Two revs of `gpui` are two unrelated sets of types. Never pin `gpui` directly.
 5. **Tokens by name, and the same names as Ginka.** No view hardcodes a colour, radius or duration; `assets/themes/*.json` is Ginka's file unchanged.
 6. **Domain logic belongs in `kirikumo-kube` or `kirikumo-ui`, not in `kirikumo-views`.** If it can be tested without a window, it must live where it can be tested without a window. This is also a compiler constraint: `rustc` overflows its stack expanding `#[test]` in a crate that also holds the toolkit's builder chains, so `kirikumo-views` carries no tests at all.
