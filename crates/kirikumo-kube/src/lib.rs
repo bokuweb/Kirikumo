@@ -23,6 +23,7 @@ pub mod discovery;
 pub mod error;
 pub mod health;
 pub mod kubeconfig;
+pub mod logs;
 pub mod model;
 pub mod quantity;
 pub mod rest;
@@ -33,6 +34,7 @@ pub mod yaml;
 pub use error::{Error, Result};
 pub use health::{Health, Level};
 pub use kubeconfig::{KubeConfig, kubeconfig_paths};
+pub use logs::LogStream;
 pub use model::{
     ApiResource, Catalogue, ClusterVersion, ContextRef, EventRecord, Group, LogRequest, Metrics,
     Object, ObjectList, ObjectMeta, OwnerRef, Patch, ResourceKey,
@@ -75,6 +77,14 @@ pub trait Cluster: Send + Sync {
 
     /// A container's log, as text.
     fn logs(&self, request: &LogRequest) -> Result<String>;
+
+    /// Follow a container's log.
+    ///
+    /// The stream is read on a thread of its own and ends when the container
+    /// does, which is not an error (see [`logs`]).
+    fn follow_logs(&self, _request: &LogRequest) -> Result<Box<dyn LogStream>> {
+        Err(Error::Unsupported)
+    }
 
     /// Node resource use, when `metrics.k8s.io` is installed.
     fn node_metrics(&self) -> Result<Vec<Metrics>> {

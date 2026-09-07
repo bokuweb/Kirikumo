@@ -15,6 +15,7 @@ use crate::auth::Authenticator;
 use crate::discovery::{self, ResourceListWire};
 use crate::error::{Error, Result};
 use crate::kubeconfig::ClusterAccess;
+use crate::logs::{Lines, LogStream};
 use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
     Patch,
@@ -424,6 +425,39 @@ impl Cluster for Rest {
             request.query()
         );
         self.get_text(&path)
+    }
+
+    fn follow_logs(&self, request: &LogRequest) -> Result<Box<dyn LogStream>> {
+        let path = format!(
+            "/api/v1/namespaces/{}/pods/{}/log?{}",
+            request.namespace,
+            request.pod,
+            request.clone().follow(true).query()
+        );
+        // The streaming agent, for the same reason a watch uses it: a log
+        // that says nothing for an hour is a log working as designed.
+        let (_, agent, header) = self.prepare()?;
+        let mut builder = agent.get(self.url(&path)).header("Accept", "text/plain");
+        if let Some(header) = header {
+            builder = builder.header("Authorization", header);
+        }
+        let mut response = builder.call()?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body = response
+                .body_mut()
+                .with_config()
+                .limit(64 * 1024)
+                .read_to_string()
+                .unwrap_or_default();
+            return Err(Error::from_status(status, &body));
+        }
+        let reader = response
+            .into_body()
+            .into_with_config()
+            .limit(u64::MAX)
+            .reader();
+        Ok(Box::new(Lines::new(BufReader::new(reader))))
     }
 
     fn node_metrics(&self) -> Result<Vec<Metrics>> {

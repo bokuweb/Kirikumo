@@ -594,6 +594,8 @@ pub struct LogRequest {
     pub previous: bool,
     /// Whether each line carries the time the kubelet saw it.
     pub timestamps: bool,
+    /// Whether to keep the connection open and read what comes next.
+    pub follow: bool,
 }
 
 impl LogRequest {
@@ -609,6 +611,7 @@ impl LogRequest {
             tail_lines: Some(2000),
             previous: false,
             timestamps: false,
+            follow: false,
         }
     }
 
@@ -621,6 +624,12 @@ impl LogRequest {
     /// Ask for the previous instance's log.
     pub fn previous(mut self, previous: bool) -> Self {
         self.previous = previous;
+        self
+    }
+
+    /// Ask to keep reading as the container writes.
+    pub fn follow(mut self, follow: bool) -> Self {
+        self.follow = follow;
         self
     }
 
@@ -638,6 +647,9 @@ impl LogRequest {
         }
         if self.timestamps {
             parts.push("timestamps=true".to_string());
+        }
+        if self.follow {
+            parts.push("follow=true".to_string());
         }
         parts.join("&")
     }
@@ -971,6 +983,14 @@ mod tests {
         assert!(query.contains("container=proxy"));
         assert!(query.contains("tailLines=2000"));
         assert!(query.contains("previous=true"));
+        // Not following unless asked: the plain tail is what a panel opens on.
+        assert!(!query.contains("follow"));
+        assert!(
+            LogRequest::new("default", "api")
+                .follow(true)
+                .query()
+                .contains("follow=true")
+        );
     }
 
     #[test]

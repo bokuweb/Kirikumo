@@ -11,6 +11,7 @@
 //! everything is green exercises none of the code worth looking at.
 
 use crate::error::{Error, Result};
+use crate::logs::LogStream;
 use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
     ResourceKey,
@@ -452,6 +453,17 @@ impl Cluster for Scripted {
         }
     }
 
+    fn follow_logs(&self, request: &LogRequest) -> Result<Box<dyn LogStream>> {
+        if self.logs.is_empty() {
+            return Err(Error::Unsupported);
+        }
+        Ok(Box::new(ScriptedLog {
+            pod: request.pod.clone(),
+            written: 0,
+            delay: self.watch_delay,
+        }))
+    }
+
     fn node_metrics(&self) -> Result<Vec<Metrics>> {
         match self.node_metrics.is_empty() {
             true => Err(Error::Unsupported),
@@ -732,6 +744,42 @@ impl WatchStream for ScriptedWatch {
     }
 }
 
+/// A container that keeps talking.
+///
+/// The scripted log for `KIRIKUMO_DEMO=1`: the sample lines first, then one
+/// more every few seconds for ever, so the Logs tab can be seen following
+/// something with no cluster anywhere.
+pub struct ScriptedLog {
+    /// Which pod, so the lines name it.
+    pod: String,
+    /// How many lines have been written.
+    written: usize,
+    /// How long to wait before each one after the sample.
+    delay: Wait,
+}
+
+impl LogStream for ScriptedLog {
+    fn next_line(&mut self) -> Option<std::result::Result<String, Error>> {
+        let sample: Vec<&str> = SAMPLE_LOG.lines().collect();
+        if self.written < sample.len() {
+            let line = sample[self.written].to_string();
+            self.written += 1;
+            return Some(Ok(line));
+        }
+        // Past the sample: one line at a time, at the pace of the demo's
+        // watch, which is what makes *following* visible rather than just
+        // asserted.
+        std::thread::sleep(self.delay);
+        self.written += 1;
+        Some(Ok(format!(
+            "{} INFO  GET /healthz 200 0.3ms pod={} line={}",
+            Utc::now().to_rfc3339(),
+            self.pod,
+            self.written
+        )))
+    }
+}
+
 /// A few lines that look like something, for the Logs tab.
 const SAMPLE_LOG: &str = "\
 2026-09-07T09:14:02.118Z INFO  starting, version=1.4.0 commit=9f2c1ab
@@ -933,6 +981,31 @@ mod tests {
         assert!(matches!(
             cluster.watch(&absent, None, "1"),
             Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_scripted_log_replays_the_sample_and_then_keeps_talking() {
+        let cluster = Scripted::sample().with_watch_delay(std::time::Duration::ZERO);
+        let mut stream = cluster
+            .follow_logs(&LogRequest::new("shop", "api-7d9f8c-2xk4t"))
+            .unwrap();
+        let sample = SAMPLE_LOG.lines().count();
+        for expected in SAMPLE_LOG.lines() {
+            assert_eq!(stream.next_line().unwrap().unwrap(), expected);
+        }
+        // And then it does not end, which is the point of following.
+        let next = stream.next_line().unwrap().unwrap();
+        assert!(next.contains("api-7d9f8c-2xk4t"), "{next}");
+        assert!(next.contains(&format!("line={}", sample + 1)), "{next}");
+    }
+
+    #[test]
+    fn a_cluster_with_no_logs_cannot_be_followed() {
+        let cluster = Scripted::empty();
+        assert!(matches!(
+            cluster.follow_logs(&LogRequest::new("a", "b")),
+            Err(Error::Unsupported)
         ));
     }
 

@@ -125,6 +125,8 @@ pub struct Shell {
     pending_filter: Option<String>,
     /// Something to open once discovery has landed.
     open_at_launch: Option<Target>,
+    /// Whether to open it on its Logs tab.
+    logs_at_launch: bool,
     /// The appearance changed and the theme has to be installed at the next
     /// frame, which is the first place with a window to ask.
     retheme: bool,
@@ -172,7 +174,7 @@ impl Shell {
         });
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), window, cx));
         let table = cx.new(|cx| ResourceTable::new(store.clone(), cx));
-        let detail = cx.new(|cx| Detail::new(store.clone(), cx));
+        let detail = cx.new(|cx| Detail::new(store.clone(), window, cx));
         let palette = cx.new(|cx| Palette::new(store.clone(), window, cx));
 
         let mut subscriptions = Vec::new();
@@ -266,6 +268,7 @@ impl Shell {
             open_palette_pending: false,
             pending_filter: None,
             open_at_launch: None,
+            logs_at_launch: false,
             retheme: false,
             resizing: None,
             transitions: Vec::new(),
@@ -603,8 +606,9 @@ impl Shell {
     /// For demos and screenshots (`KIRIKUMO_DEMO_OPEN=Pod/shop/api-…`, the
     /// namespace empty for a cluster-scoped kind). Goes through the same path
     /// a link does, so it exercises what a reader would.
-    pub fn open_at_launch(&mut self, target: Target, cx: &mut Context<Self>) {
+    pub fn open_at_launch(&mut self, target: Target, logs: bool, cx: &mut Context<Self>) {
         self.open_at_launch = Some(target);
+        self.logs_at_launch = logs;
         cx.notify();
     }
 
@@ -1058,6 +1062,10 @@ impl Render for Shell {
             && let Some(target) = self.open_at_launch.take()
         {
             self.navigate(target, cx);
+            if self.logs_at_launch {
+                self.logs_at_launch = false;
+                self.detail.update(cx, |detail, cx| detail.show_logs(cx));
+            }
         }
         if self.open_palette_pending && self.store.read(cx).catalogue().value().is_some() {
             self.open_palette_pending = false;

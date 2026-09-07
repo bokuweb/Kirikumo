@@ -15,7 +15,7 @@ use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
     ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, LogRequest,
-    Metrics, Object, ObjectList, ResourceKey, WatchEvent, watch,
+    Metrics, Object, ObjectList, ResourceKey, WatchEvent, logs, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
@@ -49,7 +49,15 @@ pub struct Store {
     namespaces: Fetch<Vec<String>>,
     lists: HashMap<ListKey, Fetch<ObjectList>>,
     events: HashMap<String, Fetch<Vec<EventRecord>>>,
-    logs: HashMap<String, Fetch<String>>,
+    /// Each container's log, as lines — never as one string, because the
+    /// view is a virtualized list over them and splitting a fifty-thousand
+    /// line log on every frame is the whole performance budget.
+    logs: HashMap<String, Fetch<Vec<String>>>,
+    /// The log being followed, if one is.
+    log_follow: Option<LogFollow>,
+    /// Bumped for every follow started, so a line from an abandoned one is
+    /// recognised and dropped.
+    log_generation: u64,
     /// What every node is using, when the cluster has a metrics server.
     node_metrics: Fetch<Vec<Metrics>>,
     /// What every pod in a namespace is using, likewise, by namespace.
@@ -63,6 +71,15 @@ pub struct Store {
     /// Bumped for every watch started, so an event from one that has been
     /// abandoned is recognised and dropped.
     generation: u64,
+}
+
+/// A log being followed, and the way to tell it to stop.
+struct LogFollow {
+    /// Which generation it belongs to.
+    generation: u64,
+    /// Set when it is abandoned. Noticed at the next line the container
+    /// writes, or when the channel closes.
+    stop: Arc<AtomicBool>,
 }
 
 /// A watch that is running, and the way to tell it to stop.
@@ -97,6 +114,8 @@ impl Store {
             lists: HashMap::new(),
             events: HashMap::new(),
             logs: HashMap::new(),
+            log_follow: None,
+            log_generation: 0,
             node_metrics: Fetch::Idle,
             pod_metrics: HashMap::new(),
             followed: None,
@@ -162,6 +181,7 @@ impl Store {
         self.namespaces = Fetch::Idle;
         self.lists.clear();
         self.events.clear();
+        self.stop_following_log();
         self.logs.clear();
         self.node_metrics = Fetch::Idle;
         self.pod_metrics.clear();
@@ -437,8 +457,13 @@ impl Store {
     }
 
     /// A container's log, if it has ever been asked for.
-    pub fn logs(&self, key: &str) -> Option<&Fetch<String>> {
+    pub fn logs(&self, key: &str) -> Option<&Fetch<Vec<String>>> {
         self.logs.get(key)
+    }
+
+    /// Whether a log is being followed.
+    pub fn is_following_log(&self) -> bool {
+        self.log_follow.is_some()
     }
 
     /// The key a log is stored under: the pod, and the container within it.
@@ -451,16 +476,25 @@ impl Store {
         )
     }
 
-    /// Fetch a log only if it never has been.
-    pub fn ensure_logs(&mut self, request: LogRequest, cx: &mut Context<Self>) {
+    /// Show a container's log, following it or not.
+    ///
+    /// The two are one request, not two: `follow=true&tailLines=n` replays
+    /// the tail and then keeps going, so following is not "fetch, then also
+    /// stream" — it is the same question asked with the connection left open.
+    pub fn show_log(&mut self, request: LogRequest, follow: bool, cx: &mut Context<Self>) {
+        self.stop_following_log();
         let key = Self::log_key(&request);
-        if self.logs.get(&key).is_some_and(|fetch| !fetch.is_idle()) {
-            return;
+        match follow {
+            true => self.start_following_log(key, request, cx),
+            false => {
+                if self.logs.get(&key).is_none_or(Fetch::is_idle) {
+                    self.load_logs(request, cx);
+                }
+            }
         }
-        self.load_logs(request, cx);
     }
 
-    /// Fetch a log.
+    /// Fetch a log's tail, once.
     pub fn load_logs(&mut self, request: LogRequest, cx: &mut Context<Self>) {
         let key = Self::log_key(&request);
         self.logs.entry(key.clone()).or_default().begin();
@@ -468,9 +502,98 @@ impl Store {
             cx,
             move |cluster| cluster.logs(&request),
             move |this, result, _| {
-                this.logs.entry(key).or_default().finish(result);
+                let lines = result.map(|text| text.lines().map(str::to_string).collect());
+                this.logs.entry(key).or_default().finish(lines);
             },
         );
+    }
+
+    /// Follow a log: read it on a thread and append what arrives.
+    fn start_following_log(&mut self, key: String, request: LogRequest, cx: &mut Context<Self>) {
+        // A followed log starts empty and fills, rather than showing the last
+        // tail while the new one arrives: the lines are about to be replayed
+        // anyway, and showing them twice is worse than showing them late.
+        self.logs
+            .insert(key.clone(), Fetch::Loading { stale: None });
+        self.log_generation += 1;
+        let generation = self.log_generation;
+        let stop = Arc::new(AtomicBool::new(false));
+        self.log_follow = Some(LogFollow {
+            generation,
+            stop: stop.clone(),
+        });
+
+        let (sender, receiver) = async_channel::unbounded::<Result<String, String>>();
+        let cluster = self.cluster.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("kirikumo-log-{}", request.pod))
+            .spawn(move || pump_log(cluster, request, stop, sender))
+        {
+            tracing::warn!(%error, "could not start following a log");
+            self.log_follow = None;
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(message) = receiver.recv().await {
+                let carry_on = this
+                    .update(cx, |this, cx| {
+                        this.on_log_line(generation, &key, message, cx)
+                    })
+                    .unwrap_or(false);
+                if !carry_on {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Stop following, if anything is.
+    pub fn stop_following_log(&mut self) {
+        if let Some(follow) = self.log_follow.take() {
+            follow.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// One line from a followed log, and whether to keep reading.
+    fn on_log_line(
+        &mut self,
+        generation: u64,
+        key: &str,
+        message: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .log_follow
+            .as_ref()
+            .is_none_or(|follow| follow.generation != generation)
+        {
+            return false;
+        }
+        let held = self.logs.entry(key.to_string()).or_default();
+        match message {
+            Ok(line) => {
+                // The first line turns a `Loading` into a `Ready`, so the
+                // skeleton gives way the moment the container says anything.
+                if held.value().is_none() {
+                    held.finish(Ok(Vec::new()));
+                }
+                if let Some(lines) = held.value_mut() {
+                    logs::append(lines, line);
+                }
+                cx.emit(StoreEvent::Changed);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                held.finish(Err(error));
+                self.stop_following_log();
+                cx.emit(StoreEvent::Changed);
+                cx.notify();
+                false
+            }
+        }
     }
 
     /// Ask for what a kind's objects are using, if it is a kind that uses
@@ -645,6 +768,36 @@ fn pump(
                 }
                 std::thread::sleep(backoff.next_delay());
             }
+        }
+    }
+}
+
+/// One log, read to its end on a thread of its own.
+///
+/// Simpler than a watch's pump because there is nothing to resume from and
+/// nothing to reconnect for: a log that ends has ended, because the container
+/// writing it has. A caller that wants it again asks again.
+fn pump_log(
+    cluster: Arc<dyn Cluster>,
+    request: LogRequest,
+    stop: Arc<AtomicBool>,
+    sender: async_channel::Sender<Result<String, String>>,
+) {
+    let mut stream = match cluster.follow_logs(&request) {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = sender.send_blocking(Err(describe(&error)));
+            return;
+        }
+    };
+    while let Some(line) = stream.next_line() {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let message = line.map_err(|error| describe(&error));
+        let failed = message.is_err();
+        if sender.send_blocking(message).is_err() || failed {
+            return;
         }
     }
 }

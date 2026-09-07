@@ -13,11 +13,12 @@ use crate::store::{ObjectKey, Store, StoreEvent};
 use chrono::Utc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, StyledExt as _, h_flex, v_flex};
 use kirikumo_kube::{LogRequest, Object, yaml};
 use kirikumo_ui::assets::icon;
 use kirikumo_ui::detail::Target;
-use kirikumo_ui::{Tokens, detail, time};
+use kirikumo_ui::{Tokens, detail, logs, time};
 use serde_json::Value;
 
 /// How tall one line of YAML or of a log is.
@@ -64,11 +65,31 @@ pub struct Detail {
     tab: Tab,
     /// Which container's log is showing, when the object has more than one.
     container: Option<String>,
+    /// Whether the log is being followed as the container writes.
+    following: bool,
+    /// Whether to read the *previous* instance's log, which is the only place
+    /// a crash loop's reason survives.
+    previous: bool,
+    /// The find box over the log.
+    find: Entity<InputState>,
+    scroll: UniformListScrollHandle,
+    /// How many lines the log had at the last frame, so that following can
+    /// tell "something arrived" from "nothing did".
+    last_lines: usize,
 }
 
 impl Detail {
     /// A panel over a store, showing nothing until told what to.
-    pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let find = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(rust_i18n::t!("detail.find").to_string())
+        });
+        cx.subscribe(&find, |_, _, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                cx.notify();
+            }
+        })
+        .detach();
         // Asked again on every change, not just when a tab is opened: an
         // object reached by a link is drawn before the list it lives in has
         // landed, so the moment it does the tab has to ask for its events.
@@ -83,6 +104,13 @@ impl Detail {
             key: None,
             tab: Tab::Overview,
             container: None,
+            // Following is what a person opening a log wants; a tail that
+            // stops the moment it is drawn is a screenshot.
+            following: true,
+            previous: false,
+            find,
+            scroll: UniformListScrollHandle::new(),
+            last_lines: 0,
         }
     }
 
@@ -96,6 +124,7 @@ impl Detail {
             self.container = None;
         }
         self.key = Some(key);
+        self.stop_following(cx);
         self.ensure(cx);
         cx.notify();
     }
@@ -103,21 +132,57 @@ impl Detail {
     /// Nothing is open.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.key = None;
+        self.stop_following(cx);
         cx.notify();
+    }
+
+    /// Stop reading a log, which every move away from one has to do: a
+    /// followed log is a thread and a connection, and nothing else on screen
+    /// needs either.
+    fn stop_following(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, _| store.stop_following_log());
+        self.last_lines = 0;
     }
 
     /// Fetch again whatever the open tab is showing.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if let (Tab::Logs, Some(request)) = (self.tab, self.log_request(cx)) {
-            self.store
-                .update(cx, |store, cx| store.load_logs(request, cx));
+        if self.tab == Tab::Logs {
+            self.reload_log(cx);
+            return;
         }
         self.ensure(cx);
     }
 
     fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if self.tab == Tab::Logs && tab != Tab::Logs {
+            self.stop_following(cx);
+        }
+        let entering_logs = tab == Tab::Logs && self.tab != Tab::Logs;
         self.tab = tab;
-        self.ensure(cx);
+        // Coming *back* to a log has to start following again, and `ensure`
+        // will not: it asks only for what has never been asked for, and this
+        // log's lines are still here from last time.
+        match entering_logs {
+            true => self.reload_log(cx),
+            false => self.ensure(cx),
+        }
+        cx.notify();
+    }
+
+    /// Open the Logs tab. For demos and screenshots.
+    pub fn show_logs(&mut self, cx: &mut Context<Self>) {
+        self.set_tab(Tab::Logs, cx);
+    }
+
+    /// Ask for the log again under whatever the toggles now say.
+    fn reload_log(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.log_request(cx) else {
+            return;
+        };
+        let following = self.following;
+        self.last_lines = 0;
+        self.store
+            .update(cx, |store, cx| store.show_log(request, following, cx));
         cx.notify();
     }
 
@@ -142,8 +207,19 @@ impl Detail {
             }
             Tab::Logs => {
                 if let Some(request) = self.log_request(cx) {
-                    self.store
-                        .update(cx, |store, cx| store.ensure_logs(request, cx));
+                    let following = self.following;
+                    // Only when nothing has been asked for yet: `ensure` runs
+                    // on every store change, and restarting a followed log on
+                    // each of its own lines would be a loop.
+                    let asked = self
+                        .store
+                        .read(cx)
+                        .logs(&Store::log_key(&request))
+                        .is_some_and(|fetch| !fetch.is_idle());
+                    if !asked {
+                        self.store
+                            .update(cx, |store, cx| store.show_log(request, following, cx));
+                    }
                 }
             }
             Tab::Overview | Tab::Yaml => {}
@@ -187,7 +263,11 @@ impl Detail {
             .container
             .clone()
             .or_else(|| containers.first().cloned())?;
-        Some(LogRequest::new(namespace, object.meta.name.clone()).container(container))
+        Some(
+            LogRequest::new(namespace, object.meta.name.clone())
+                .container(container)
+                .previous(self.previous),
+        )
     }
 
     /// The name, the kind and the health, across the top.
@@ -524,8 +604,8 @@ impl Detail {
         .into_any_element()
     }
 
-    /// The Logs tab: the container picker, then the lines.
-    fn logs(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The Logs tab: what to read, and then the reading of it.
+    fn logs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
         let containers = self.containers(cx);
         let current = self
@@ -537,86 +617,171 @@ impl Detail {
             .log_request(cx)
             .map(|request| Store::log_key(&request))
             .and_then(|key| self.store.read(cx).logs(&key).cloned());
-        let text = fetch.as_ref().and_then(|fetch| fetch.value()).cloned();
+        let lines = fetch
+            .as_ref()
+            .and_then(|fetch| fetch.value())
+            .cloned()
+            .unwrap_or_default();
         let error = fetch
             .as_ref()
             .and_then(|fetch| fetch.error())
             .map(str::to_string);
         let loading = fetch.as_ref().is_some_and(|fetch| fetch.is_loading());
+        let query = self.find.read(cx).value().to_string();
+        let visible = logs::matching(&lines, &query);
 
-        // The picker, when there is a choice to make.
-        let picker = (containers.len() > 1).then(|| {
-            h_flex()
-                .w_full()
-                .px_3()
-                .py_1p5()
-                .gap_1()
-                .flex_shrink_0()
-                .children(containers.into_iter().enumerate().map(|(index, name)| {
-                    let selected = name == current;
-                    let picked = name.clone();
+        // Following means the end stays in view. Only when something actually
+        // arrived: scrolling on every frame would fight the reader the moment
+        // they touched the wheel.
+        if self.following && lines.len() != self.last_lines && !visible.is_empty() {
+            self.scroll
+                .scroll_to_item(visible.len() - 1, ScrollStrategy::Top);
+        }
+        self.last_lines = lines.len();
+
+        let toolbar = h_flex()
+            .w_full()
+            .px_3()
+            .py_1p5()
+            .gap_1()
+            .flex_shrink_0()
+            .items_center()
+            .children(containers.into_iter().enumerate().map(|(index, name)| {
+                let selected = name == current;
+                let picked = name.clone();
+                div()
+                    .id(("container", index))
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(tokens.radius.control()))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .font_family("monospace")
+                    .when(selected, |this| {
+                        this.bg(tokens.colors().row_active())
+                            .text_color(tokens.colors().text_primary)
+                    })
+                    .when(!selected, |this| {
+                        this.text_color(tokens.colors().text_muted)
+                    })
+                    .hover(|this| this.bg(tokens.colors().row_hover()))
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.container = Some(picked.clone());
+                        this.reload_log(cx);
+                    }))
+            }))
+            .child(div().flex_1())
+            .child(self.toggle(
+                "follow",
+                rust_i18n::t!("detail.follow").to_string(),
+                self.following,
+                cx,
+                |this, cx| {
+                    this.following = !this.following;
+                    this.reload_log(cx);
+                },
+            ))
+            .child(self.toggle(
+                "previous",
+                rust_i18n::t!("detail.previous").to_string(),
+                self.previous,
+                cx,
+                |this, cx| {
+                    this.previous = !this.previous;
+                    this.reload_log(cx);
+                },
+            ))
+            .child(
+                div()
+                    .w(px(150.))
+                    .child(Input::new(&self.find).cleanable(true)),
+            )
+            // How much of the log the find box is hiding, which is the one
+            // number that stops a filtered log being mistaken for a short one.
+            .when(!query.trim().is_empty(), |this| {
+                this.child(
                     div()
-                        .id(("container", index))
-                        .px_2()
-                        .py_0p5()
-                        .rounded(px(tokens.radius.control()))
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .font_family("monospace")
-                        .when(selected, |this| {
-                            this.bg(tokens.colors().row_active())
-                                .text_color(tokens.colors().text_primary)
-                        })
-                        .when(!selected, |this| {
-                            this.text_color(tokens.colors().text_muted)
-                        })
-                        .hover(|this| this.bg(tokens.colors().row_hover()))
-                        .child(name)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.container = Some(picked.clone());
-                            this.ensure(cx);
-                            cx.notify();
-                        }))
-                }))
-                .into_any_element()
-        });
+                        .flex_shrink_0()
+                        .text_size(px(10.5))
+                        .text_color(tokens.colors().text_muted)
+                        .child(format!("{}/{}", visible.len(), lines.len())),
+                )
+            });
 
-        let body: AnyElement = match (text, error, loading) {
-            (Some(text), _, _) if !text.trim().is_empty() => {
-                let lines: Vec<SharedString> = text
-                    .lines()
-                    .map(|line| SharedString::from(line.to_string()))
-                    .collect();
-                let colors = *tokens.colors();
-                uniform_list("log", lines.len(), move |range, _window, _cx| {
-                    range
-                        .map(|index| {
-                            let line = lines.get(index).cloned().unwrap_or_default();
-                            div()
-                                .w_full()
-                                .h(LINE_HEIGHT)
-                                .px_3()
-                                .text_size(px(12.))
-                                .font_family("monospace")
-                                .text_color(colors.text_secondary)
-                                .child(line)
-                        })
-                        .collect()
-                })
-                .size_full()
-                .into_any_element()
-            }
-            (_, Some(error), _) => self.notice(error, true, cx),
-            (_, None, true) => crate::skeleton::detail(cx),
-            _ => self.notice(rust_i18n::t!("detail.logs_empty").to_string(), false, cx),
+        let body: AnyElement = if !visible.is_empty() {
+            let colors = *tokens.colors();
+            // Cloned into the closure rather than read from the store on each
+            // frame: the closure outlives this borrow, and a log's lines are
+            // `Arc`-free `String`s the list only ever reads.
+            let all = lines.clone();
+            let indices = visible.clone();
+            uniform_list("log", indices.len(), move |range, _window, _cx| {
+                range
+                    .map(|position| {
+                        let line = indices
+                            .get(position)
+                            .and_then(|index| all.get(*index))
+                            .cloned()
+                            .unwrap_or_default();
+                        div()
+                            .w_full()
+                            .h(LINE_HEIGHT)
+                            .px_3()
+                            .text_size(px(12.))
+                            .font_family("monospace")
+                            .text_color(colors.text_secondary)
+                            .child(line)
+                    })
+                    .collect()
+            })
+            .track_scroll(&self.scroll)
+            .size_full()
+            .into_any_element()
+        } else if let Some(error) = error {
+            self.notice(error, true, cx)
+        } else if loading {
+            crate::skeleton::detail(cx)
+        } else if !query.trim().is_empty() && !lines.is_empty() {
+            self.notice(rust_i18n::t!("table.no_matches").to_string(), false, cx)
+        } else {
+            self.notice(rust_i18n::t!("detail.logs_empty").to_string(), false, cx)
         };
 
         v_flex()
             .size_full()
             .bg(tokens.colors().bg_terminal)
-            .children(picker)
+            .child(toolbar)
             .child(div().flex_1().min_h_0().w_full().child(body))
             .into_any_element()
+    }
+
+    /// A small on/off chip in the log's toolbar.
+    fn toggle(
+        &self,
+        id: &'static str,
+        label: String,
+        on: bool,
+        cx: &mut Context<Self>,
+        act: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let tokens = Tokens::global(cx).clone();
+        div()
+            .id(id)
+            .px_2()
+            .py_0p5()
+            .flex_shrink_0()
+            .rounded(px(tokens.radius.control()))
+            .cursor_pointer()
+            .text_size(px(11.))
+            .when(on, |this| {
+                this.bg(tokens.colors().row_active())
+                    .text_color(tokens.colors().text_primary)
+            })
+            .when(!on, |this| this.text_color(tokens.colors().text_muted))
+            .hover(|this| this.bg(tokens.colors().row_hover()))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| act(this, cx)))
     }
 
     /// One muted or red line.

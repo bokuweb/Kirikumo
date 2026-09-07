@@ -131,6 +131,15 @@ detail.events_empty:
 detail.logs_empty:
   en: This container has said nothing
   ja: このコンテナの出力はありません
+detail.follow:
+  en: Follow
+  ja: 追従
+detail.previous:
+  en: Previous
+  ja: 前回
+detail.find:
+  en: Find
+  ja: 検索
 detail.container:
   en: Container
   ja: コンテナ

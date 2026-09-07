@@ -65,20 +65,29 @@ fn source(settings: &AppSettings) -> (Arc<dyn Cluster>, Option<KubeConfig>) {
 
 /// `KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t`: an object to open as soon
 /// as the window is up, as `Kind/namespace/name` with the namespace left
-/// empty for a cluster-scoped kind. For screenshots — and it goes through the
+/// empty for a cluster-scoped kind, and a trailing `#logs` to open it on its
+/// Logs tab. For screenshots — and it goes through the
 /// same path a link in the detail panel does, so it exercises what a reader
 /// would.
-fn open_at_launch() -> Option<Target> {
+fn open_at_launch() -> Option<(Target, bool)> {
     let value = std::env::var("KIRIKUMO_DEMO_OPEN").ok()?;
+    // A trailing `#logs` opens it on its Logs tab.
+    let (value, logs) = match value.strip_suffix("#logs") {
+        Some(value) => (value.to_string(), true),
+        None => (value, false),
+    };
     let mut parts = value.splitn(3, '/');
     let key = ResourceKey::parse(parts.next()?)?;
     let namespace = parts.next()?;
     let name = parts.next()?;
-    Some(Target::Object {
-        key,
-        namespace: Some(namespace.to_string()).filter(|namespace| !namespace.is_empty()),
-        name: name.to_string(),
-    })
+    Some((
+        Target::Object {
+            key,
+            namespace: Some(namespace.to_string()).filter(|namespace| !namespace.is_empty()),
+            name: name.to_string(),
+        },
+        logs,
+    ))
 }
 
 fn main() -> Result<()> {
@@ -137,8 +146,8 @@ fn main() -> Result<()> {
                         cx,
                     )
                 });
-                if let Some(target) = open {
-                    shell.update(cx, |shell, cx| shell.open_at_launch(target, cx));
+                if let Some((target, logs)) = open {
+                    shell.update(cx, |shell, cx| shell.open_at_launch(target, logs, cx));
                 }
                 if open_palette {
                     shell.update(cx, |shell, cx| shell.open_palette_at_launch(cx));
