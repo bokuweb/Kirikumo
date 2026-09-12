@@ -16,11 +16,11 @@ It is the third window in a family that becomes one application: **Ginka** (codi
 
 ## Current state
 
-**M0 to M3 have landed; M4 (acting on a cluster) has not started.** The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns, a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
+**M0 to M4 have landed, drain excepted; M5 (exec, port-forward, and the mount into Ginka) has not started.** The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns, a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
 
 **The table is live.** The list on screen — and only that one — is followed: a thread reads the watch, bookmarks keep the resume point moving, a `410 Gone` re-lists, a dropped connection backs off, and only the rows whose objects actually moved are formatted again. `KIRIKUMO_DEMO=1` has a scripted watch, so the whole path can be exercised without a cluster.
 
-`⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, reports what a pod or node is using when the cluster has a metrics server, and **follows a container's log** with a previous-instance toggle and a literal find. What is *not* there yet: **no writes at all**, which is M4. See `docs/roadmap.md` §5.
+`⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, reports what a pod or node is using when the cluster has a metrics server, and **follows a container's log** with a previous-instance toggle and a literal find. **It can act**: scale, restart, cordon/uncordon, delete, and apply an edited manifest, each behind a second button that names the object and each greyed out when RBAC says no. What is *not* there yet: drain, exec, port-forward, and the mount into Ginka. See `docs/roadmap.md` §5.
 
 ## Commands
 
@@ -30,7 +30,7 @@ cargo run --release
 KIRIKUMO_DEMO=1 cargo run                   # the same window over a scripted cluster, no network
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_PALETTE=1 cargo run   # ...opened on the palette, for screenshots
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t cargo run   # ...opened on one object
-KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Pod/shop/api-7d9f8c-2xk4t#logs' cargo run  # ...on its log, following
+KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Pod/shop/api-7d9f8c-2xk4t#logs' cargo run  # ...on its log, following (#events, #yaml too)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
@@ -71,7 +71,7 @@ These are load-bearing. Each one exists so that Ginka can mount these views; vio
 4. **One toolkit, at Ginka's rev.** `gpui-component` is the only linked UI library and it owns the `gpui` rev; `Cargo.lock` pins both to what Ginka's and e1's locks pin. Two revs of `gpui` are two unrelated sets of types. Never pin `gpui` directly.
 5. **Tokens by name, and the same names as Ginka.** No view hardcodes a colour, radius or duration; `assets/themes/*.json` is Ginka's file unchanged.
 6. **Domain logic belongs in `kirikumo-kube` or `kirikumo-ui`, not in `kirikumo-views`.** If it can be tested without a window, it must live where it can be tested without a window. This is also a compiler constraint: `rustc` overflows its stack expanding `#[test]` in a crate that also holds the toolkit's builder chains, so `kirikumo-views` carries no tests at all.
-7. **Long lists are virtualized from the first commit.** The table, the YAML view and the log view are each one `uniform_list`; a namespace with four thousand pods must not cost four thousand elements.
+7. **Long lists are virtualized from the first commit.** The table and the log view are each one `uniform_list`, and the YAML tab is the toolkit's editor, which virtualizes for itself; a namespace with four thousand pods must not cost four thousand elements.
 8. **Nothing is typed per kind that can be read generically.** An object is JSON plus its `ObjectMeta`; a column set, a health rule and a detail section are functions of that JSON. This is what makes a CRD free, and it is the reason there is no code generation here.
 9. **Read-only by default, and no write without two deliberate gestures — the second naming the object.** No destructive action is reachable from a key chord. This app acts on production and will one day share a key map with two apps that do not.
 10. **Nothing about a cluster is written to disk.** No response cache, no snapshot, no credential. Settings are the only thing this app writes.

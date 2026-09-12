@@ -140,9 +140,67 @@ detail.previous:
 detail.find:
   en: Find
   ja: 検索
+detail.yaml_readonly:
+  en: As the apiserver holds it. Edit to change it.
+  ja: apiserver が保持している内容です。変更するには「編集」を押してください。
 detail.container:
   en: Container
   ja: コンテナ
+
+# The writes. Each is reached from the object it acts on and confirmed by a
+# second button that names it (AGENTS.md rule 9); nothing here is bound to a
+# key or offered by the palette.
+action.scale:
+  en: Scale
+  ja: スケール
+action.restart:
+  en: Restart
+  ja: 再起動
+action.cordon:
+  en: Cordon
+  ja: Cordon
+action.uncordon:
+  en: Uncordon
+  ja: Uncordon
+action.apply:
+  en: Apply
+  ja: 適用
+action.delete:
+  en: Delete
+  ja: 削除
+action.edit:
+  en: Edit
+  ja: 編集
+action.cancel:
+  en: Cancel
+  ja: キャンセル
+action.working:
+  en: Working…
+  ja: 実行中…
+action.forbidden:
+  en: Not allowed for this login
+  ja: このログインでは許可されていません
+action.replicas:
+  en: Replicas
+  ja: レプリカ数
+action.confirm.scale:
+  en: "Scale %{name} to %{replicas}"
+  ja: "%{name} を %{replicas} にスケール"
+action.confirm.restart:
+  en: "Restart %{name}"
+  ja: "%{name} を再起動"
+action.confirm.cordon:
+  en: "Cordon %{name}"
+  ja: "%{name} を cordon"
+action.confirm.uncordon:
+  en: "Uncordon %{name}"
+  ja: "%{name} を uncordon"
+action.confirm.apply:
+  en: "Apply to %{name}"
+  ja: "%{name} に適用"
+action.confirm.delete:
+  en: "Delete %{name}"
+  ja: "%{name} を削除"
 
 welcome.title:
   en: No cluster

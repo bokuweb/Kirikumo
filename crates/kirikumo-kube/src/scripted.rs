@@ -9,18 +9,26 @@
 //! The sample is deliberately unhealthy: a crash loop, a pending pod, a
 //! cordoned node, a suspended cron job and a custom resource. A demo where
 //! everything is green exercises none of the code worth looking at.
+//!
+//! It accepts writes. A delete removes, a patch merges (RFC 7386 — see
+//! [`Cluster::patch`] on this type for what that means for a *strategic*
+//! merge), and every write hands out a new `resourceVersion` the way the
+//! apiserver does, so the whole M4 flow — the two gestures, the request, the
+//! row changing under the reader — can be seen with no cluster to break.
 
+use crate::actions::merge_patch;
 use crate::error::{Error, Result};
 use crate::logs::LogStream;
 use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
-    ResourceKey,
+    Patch, ResourceKey,
 };
 use crate::watch::{WatchEvent, WatchStream};
 use crate::{Cluster, discovery};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration as Wait;
 
 /// An in-memory cluster.
@@ -28,7 +36,14 @@ pub struct Scripted {
     version: ClusterVersion,
     catalogue: Catalogue,
     namespaces: Vec<String>,
-    objects: HashMap<ResourceKey, Vec<Object>>,
+    /// Behind a lock because the trait is `&self` and the scripted cluster
+    /// accepts writes: a demo delete or scale is real, so the flow can be
+    /// seen end to end without a cluster to break.
+    objects: Mutex<HashMap<ResourceKey, Vec<Object>>>,
+    /// The version the next write hands out. A live apiserver bumps
+    /// `resourceVersion` on every write, and the table relies on that to
+    /// know a row has to be drawn again.
+    next_version: Mutex<u64>,
     /// Events by the uid of the object they are about.
     events: HashMap<String, Vec<EventRecord>>,
     node_metrics: Vec<Metrics>,
@@ -49,7 +64,8 @@ impl Scripted {
             version: ClusterVersion::default(),
             catalogue: Catalogue::default(),
             namespaces: Vec::new(),
-            objects: HashMap::new(),
+            objects: Mutex::new(HashMap::new()),
+            next_version: Mutex::new(1),
             events: HashMap::new(),
             node_metrics: Vec::new(),
             pod_metrics: Vec::new(),
@@ -339,7 +355,8 @@ impl Scripted {
                 "observability".into(),
                 "shop".into(),
             ],
-            objects,
+            objects: Mutex::new(objects),
+            next_version: Mutex::new(5000),
             events,
             node_metrics: vec![
                 Metrics {
@@ -389,8 +406,42 @@ impl Scripted {
     }
 
     /// The objects of a kind, whatever namespace they are in.
-    fn all(&self, key: &ResourceKey) -> &[Object] {
-        self.objects.get(key).map(Vec::as_slice).unwrap_or_default()
+    fn all(&self, key: &ResourceKey) -> Vec<Object> {
+        self.objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Where an object sits among its kind, or a not-found the way the
+    /// apiserver would word it.
+    fn position(
+        held: &[Object],
+        resource: &ApiResource,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<usize> {
+        held.iter()
+            .position(|object| {
+                object.meta.name == name
+                    && match namespace.filter(|_| resource.namespaced) {
+                        Some(namespace) => object.meta.namespace.as_deref() == Some(namespace),
+                        None => true,
+                    }
+            })
+            .ok_or_else(|| Error::NotFound(format!("{} {name:?}", resource.kind)))
+    }
+
+    /// A fresh `resourceVersion`, as a write would be given one.
+    fn bump(&self) -> String {
+        let mut next = self
+            .next_version
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *next += 1;
+        next.to_string()
     }
 }
 
@@ -411,12 +462,11 @@ impl Cluster for Scripted {
         let namespace = namespace.filter(|namespace| resource.namespaced && !namespace.is_empty());
         let items = self
             .all(&resource.key())
-            .iter()
+            .into_iter()
             .filter(|object| match namespace {
                 Some(namespace) => object.meta.namespace.as_deref() == Some(namespace),
                 None => true,
             })
-            .cloned()
             .collect();
         Ok(ObjectList {
             items,
@@ -426,17 +476,55 @@ impl Cluster for Scripted {
     }
 
     fn get(&self, resource: &ApiResource, namespace: Option<&str>, name: &str) -> Result<Object> {
-        self.all(&resource.key())
-            .iter()
-            .find(|object| {
-                object.meta.name == name
-                    && match namespace.filter(|_| resource.namespaced) {
-                        Some(namespace) => object.meta.namespace.as_deref() == Some(namespace),
-                        None => true,
-                    }
-            })
-            .cloned()
-            .ok_or_else(|| Error::NotFound(format!("{} {name:?}", resource.kind)))
+        let held = self.all(&resource.key());
+        let index = Self::position(&held, resource, namespace, name)?;
+        Ok(held[index].clone())
+    }
+
+    fn delete(&self, resource: &ApiResource, namespace: Option<&str>, name: &str) -> Result<()> {
+        let mut objects = self
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let held = objects.entry(resource.key()).or_default();
+        let index = Self::position(held, resource, namespace, name)?;
+        held.remove(index);
+        Ok(())
+    }
+
+    /// A patch, applied the way the apiserver would apply the patches this
+    /// app sends.
+    ///
+    /// A merge patch is RFC 7386, exactly. A *strategic* merge patch is
+    /// applied with the same rule, which is right for every patch this app
+    /// makes — none of them touch a list — and wrong for one that does: a
+    /// strategic merge of a containers list merges by name, and this would
+    /// replace it. A JSON patch is refused, because this app never sends
+    /// one and a fake that accepted it would be pretending.
+    fn patch(
+        &self,
+        resource: &ApiResource,
+        namespace: Option<&str>,
+        name: &str,
+        patch: Patch,
+    ) -> Result<Object> {
+        let version = self.bump();
+        let mut objects = self
+            .objects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let held = objects.entry(resource.key()).or_default();
+        let index = Self::position(held, resource, namespace, name)?;
+        let mut raw = held[index].raw.clone();
+        match &patch {
+            Patch::Merge(change) | Patch::Strategic(change) => merge_patch(&mut raw, change),
+            Patch::Replace(whole) => raw = whole.clone(),
+            Patch::Json(_) => return Err(Error::Unsupported),
+        }
+        raw["metadata"]["resourceVersion"] = json!(version);
+        let updated = Object::new(raw)?;
+        held[index] = updated.clone();
+        Ok(updated)
     }
 
     fn events_for(&self, uid: &str, _namespace: Option<&str>) -> Result<Vec<EventRecord>> {
@@ -890,19 +978,68 @@ mod tests {
     }
 
     #[test]
-    fn a_scripted_cluster_refuses_writes_by_inheriting_the_traits_defaults() {
+    fn a_delete_is_real_and_the_list_no_longer_has_it() {
         let cluster = Scripted::sample();
         let pods = resource_for(&cluster, "", "Pod");
+        let before = cluster.list(&pods, Some("shop")).unwrap().items.len();
+        cluster
+            .delete(&pods, Some("shop"), "api-7d9f8c-2xk4t")
+            .unwrap();
+        let after = cluster.list(&pods, Some("shop")).unwrap();
+        assert_eq!(after.items.len(), before - 1);
+        assert!(
+            cluster
+                .get(&pods, Some("shop"), "api-7d9f8c-2xk4t")
+                .is_err()
+        );
+        // Deleting it again is a not-found, as the apiserver would say.
         assert!(matches!(
             cluster.delete(&pods, Some("shop"), "api-7d9f8c-2xk4t"),
-            Err(Error::Unsupported)
+            Err(Error::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn a_patch_merges_and_hands_out_a_new_version() {
+        let cluster = Scripted::sample();
+        let deployments = resource_for(&cluster, "apps", "Deployment");
+        let before = cluster.get(&deployments, Some("shop"), "api").unwrap();
+        let after = cluster
+            .patch(&deployments, Some("shop"), "api", crate::actions::scale(5))
+            .unwrap();
+        assert_eq!(crate::actions::current_replicas(&after), 5);
+        assert_ne!(after.meta.resource_version, before.meta.resource_version);
+        // The rest of the object survived the merge.
+        assert_eq!(after.str_at("spec.strategy.type"), "RollingUpdate");
+        // And the change is what a later list sees.
+        let listed = cluster.get(&deployments, Some("shop"), "api").unwrap();
+        assert_eq!(crate::actions::current_replicas(&listed), 5);
+    }
+
+    #[test]
+    fn a_replacement_replaces_and_a_json_patch_is_refused() {
+        let cluster = Scripted::sample();
+        let configmaps = resource_for(&cluster, "", "ConfigMap");
+        let replaced = cluster
+            .patch(
+                &configmaps,
+                Some("shop"),
+                "api-config",
+                crate::Patch::Replace(json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {"name": "api-config", "namespace": "shop"},
+                    "data": {"ONLY": "this"}
+                })),
+            )
+            .unwrap();
+        assert_eq!(replaced.str_at("data.ONLY"), "this");
+        assert_eq!(replaced.str_at("data.LOG_LEVEL"), "");
         assert!(matches!(
             cluster.patch(
-                &pods,
+                &configmaps,
                 Some("shop"),
-                "api-7d9f8c-2xk4t",
-                crate::Patch::Merge(json!({}))
+                "api-config",
+                crate::Patch::Json(json!([]))
             ),
             Err(Error::Unsupported)
         ));

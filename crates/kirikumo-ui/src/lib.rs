@@ -17,6 +17,7 @@
 // reached yet still renders as words.
 rust_i18n::i18n!("../../locales", fallback = "en");
 
+pub mod actions;
 pub mod assets;
 pub mod detail;
 pub mod fetch;
@@ -33,6 +34,7 @@ pub mod table;
 pub mod theme;
 pub mod time;
 
+pub use actions::Pending;
 pub use assets::Assets;
 pub use detail::{Condition, Fact, Overview};
 pub use fetch::Fetch;

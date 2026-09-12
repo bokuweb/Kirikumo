@@ -9,13 +9,15 @@
 //! rather than fetched again: it arrived a moment ago, and a `GET` for it
 //! would put a spinner over data the window already has.
 
-use crate::store::{ObjectKey, Store, StoreEvent};
+use crate::store::{ObjectKey, Store, StoreEvent, Write};
 use chrono::Utc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, StyledExt as _, h_flex, v_flex};
-use kirikumo_kube::{LogRequest, Object, yaml};
+use kirikumo_kube::{Action, LogRequest, Object, actions, yaml};
+use kirikumo_ui::actions::{Pending, confirm_label};
 use kirikumo_ui::assets::icon;
 use kirikumo_ui::detail::Target;
 use kirikumo_ui::{Tokens, detail, logs, time};
@@ -76,6 +78,20 @@ pub struct Detail {
     /// How many lines the log had at the last frame, so that following can
     /// tell "something arrived" from "nothing did".
     last_lines: usize,
+    /// A write between its first gesture and its second.
+    pending: Pending,
+    /// The replica count field, for a scale.
+    replicas: Entity<InputState>,
+    /// The YAML tab: the toolkit's editor, read-only until *Edit*.
+    editor: Entity<EditorState>,
+    /// Whether the YAML is being edited, which is when the editor's text is
+    /// the reader's and must not be replaced by the object's.
+    editing: bool,
+    /// Which object and version the editor was last filled from, so it is
+    /// refilled when either changes and left alone otherwise.
+    editor_holds: Option<(ObjectKey, String)>,
+    /// Why an edited manifest was refused before it was sent, if it was.
+    apply_error: Option<String>,
 }
 
 impl Detail {
@@ -90,6 +106,22 @@ impl Detail {
             }
         })
         .detach();
+        let replicas = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(rust_i18n::t!("action.replicas").to_string())
+        });
+        cx.subscribe(&replicas, |this, replicas, event: &InputEvent, cx| {
+            if let InputEvent::Change = event
+                && let Pending::Armed {
+                    action: Action::Scale,
+                    replicas: typed,
+                } = &mut this.pending
+            {
+                *typed = replicas.read(cx).value().to_string();
+                cx.notify();
+            }
+        })
+        .detach();
+        let editor = cx.new(|cx| EditorState::new(window, cx).language("yaml"));
         // Asked again on every change, not just when a tab is opened: an
         // object reached by a link is drawn before the list it lives in has
         // landed, so the moment it does the tab has to ask for its events.
@@ -111,6 +143,12 @@ impl Detail {
             find,
             scroll: UniformListScrollHandle::new(),
             last_lines: 0,
+            pending: Pending::Idle,
+            replicas,
+            editor,
+            editing: false,
+            editor_holds: None,
+            apply_error: None,
         }
     }
 
@@ -124,6 +162,10 @@ impl Detail {
             self.container = None;
         }
         self.key = Some(key);
+        // A write armed on one object must not fire on the next.
+        self.pending = Pending::Idle;
+        self.editing = false;
+        self.apply_error = None;
         self.stop_following(cx);
         self.ensure(cx);
         cx.notify();
@@ -169,9 +211,16 @@ impl Detail {
         cx.notify();
     }
 
-    /// Open the Logs tab. For demos and screenshots.
-    pub fn show_logs(&mut self, cx: &mut Context<Self>) {
-        self.set_tab(Tab::Logs, cx);
+    /// Open a tab by name. For demos and screenshots
+    /// (`KIRIKUMO_DEMO_OPEN=…#yaml`); an unknown name is the Overview.
+    pub fn show_tab_named(&mut self, name: &str, cx: &mut Context<Self>) {
+        let tab = match name {
+            "events" => Tab::Events,
+            "yaml" => Tab::Yaml,
+            "logs" => Tab::Logs,
+            _ => Tab::Overview,
+        };
+        self.set_tab(tab, cx);
     }
 
     /// Ask for the log again under whatever the toggles now say.
@@ -198,6 +247,28 @@ impl Detail {
         self.store.update(cx, |store, cx| {
             store.ensure_metrics(&kind, namespace.as_deref(), cx)
         });
+        // And whether this login may do each thing the footer offers, so a
+        // button is lit or grey before it is pressed rather than after.
+        if let Some((key, resource)) =
+            self.key
+                .as_ref()
+                .map(|(key, _, _)| key.clone())
+                .and_then(|key| {
+                    let resource = self.store.read(cx).resource(&key).cloned()?;
+                    Some((key, resource))
+                })
+        {
+            let verbs: Vec<&'static str> = actions::available(&resource, &object)
+                .into_iter()
+                .map(Action::verb)
+                .collect();
+            let namespace = namespace.filter(|_| resource.namespaced);
+            self.store.update(cx, |store, cx| {
+                for verb in verbs {
+                    store.ensure_permission(key.clone(), namespace.clone(), verb, cx);
+                }
+            });
+        }
         match self.tab {
             Tab::Events => {
                 let uid = object.meta.uid.clone();
@@ -560,48 +631,370 @@ impl Detail {
             .into_any_element()
     }
 
-    /// The YAML tab: the object as the apiserver holds it, virtualized.
-    fn yaml(&self, object: &Object, cx: &mut Context<Self>) -> AnyElement {
+    /// The YAML tab: the object as the apiserver holds it, in the toolkit's
+    /// editor — read-only until *Edit*, and then the reader's until *Apply*
+    /// or *Cancel*.
+    fn yaml(&mut self, object: &Object, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
-        let lines: Vec<SharedString> = yaml::to_yaml(&object.raw)
-            .lines()
-            .map(|line| SharedString::from(line.to_string()))
-            .collect();
-        let gutter = px(44.);
+        let Some(key) = self.key.clone() else {
+            return div().into_any_element();
+        };
+        // Refilled when the object or its version changes, and never while
+        // the text is the reader's: a watch event landing mid-edit must not
+        // throw their edit away.
+        let holds = (key.clone(), object.meta.resource_version.clone());
+        if !self.editing && self.editor_holds.as_ref() != Some(&holds) {
+            let text = yaml::to_yaml(&object.raw);
+            self.editor
+                .update(cx, |editor, cx| editor.set_value(text, window, cx));
+            self.editor_holds = Some(holds);
+        }
 
-        uniform_list("yaml", lines.len(), move |range, _window, _cx| {
-            range
-                .map(|index| {
-                    let line = lines.get(index).cloned().unwrap_or_default();
+        let editing = self.editing;
+        let armed = self.pending.action() == Some(Action::Apply);
+        let may_apply = self.permission(Action::Apply, cx) == Some(true);
+        let writing = self
+            .store
+            .read(cx)
+            .write(&key)
+            .is_some_and(|w| w.is_loading());
+        let name = object.meta.name.clone();
+
+        let strip = h_flex()
+            .w_full()
+            .px_3()
+            .py_1p5()
+            .gap_1()
+            .flex_shrink_0()
+            .items_center()
+            .justify_end()
+            .when(!editing, |this| {
+                this.child(self.button(
+                    "edit",
+                    rust_i18n::t!("action.edit").to_string(),
+                    may_apply && !writing,
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.editing = true;
+                        cx.notify();
+                    },
+                ))
+            })
+            .when(editing && !armed, |this| {
+                this.child(self.button(
+                    "apply",
+                    rust_i18n::t!("action.apply").to_string(),
+                    !writing,
+                    false,
+                    cx,
+                    |this, _, cx| this.arm(Action::Apply, cx),
+                ))
+            })
+            .when(editing && armed, |this| {
+                this.child(self.button(
+                    "confirm-apply",
+                    confirm_label(Action::Apply, &name, None),
+                    !writing,
+                    false,
+                    cx,
+                    |this, window, cx| this.confirm(window, cx),
+                ))
+            })
+            .when(editing, |this| {
+                this.child(self.button(
+                    "cancel-edit",
+                    rust_i18n::t!("action.cancel").to_string(),
+                    true,
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.editing = false;
+                        this.pending = Pending::Idle;
+                        // Forget what the editor holds, so the next frame
+                        // refills it from the object.
+                        this.editor_holds = None;
+                        cx.notify();
+                    },
+                ))
+            });
+
+        v_flex()
+            .size_full()
+            .child(strip)
+            .child(
+                div().flex_1().min_h_0().w_full().px_2().pb_2().child(
+                    Editor::new(&self.editor)
+                        .readonly(!editing)
+                        .bordered(editing)
+                        .h(relative(1.))
+                        .text_size(px(12.)),
+                ),
+            )
+            .when(!editing, |this| {
+                // A hint that the text is the apiserver's, not the reader's.
+                this.child(
+                    div()
+                        .px_3()
+                        .pb_1p5()
+                        .text_size(px(10.5))
+                        .text_color(tokens.colors().text_muted)
+                        .child(rust_i18n::t!("detail.yaml_readonly").to_string()),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Whether this login may do an action on the object shown, if the
+    /// cluster has said.
+    fn permission(&self, action: Action, cx: &App) -> Option<bool> {
+        let (key, namespace, _) = self.key.as_ref()?;
+        let store = self.store.read(cx);
+        let namespaced = store
+            .resource(key)
+            .is_none_or(|resource| resource.namespaced);
+        let namespace = namespace.as_deref().filter(|_| namespaced);
+        store.permission(key, namespace, action.verb())
+    }
+
+    /// The first gesture.
+    fn arm(&mut self, action: Action, cx: &mut Context<Self>) {
+        let current = self
+            .object(cx)
+            .map(|object| actions::current_replicas(&object))
+            .unwrap_or(1);
+        self.pending = Pending::arm(action, current);
+        cx.notify();
+    }
+
+    /// Back to nothing armed.
+    fn disarm(&mut self, cx: &mut Context<Self>) {
+        self.pending = Pending::Idle;
+        cx.notify();
+    }
+
+    /// The second gesture: build the write and send it.
+    fn confirm(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.pending.action() else {
+            return;
+        };
+        if !self.pending.can_confirm() {
+            return;
+        }
+        let Some(key) = self.key.clone() else {
+            return;
+        };
+        let write = match action {
+            Action::Delete => Write::Delete,
+            Action::Scale => match self.pending.replicas() {
+                Some(count) => Write::Patch(actions::scale(count)),
+                None => return,
+            },
+            Action::Restart => Write::Patch(actions::restart(Utc::now())),
+            Action::Cordon => Write::Patch(actions::schedulable(true)),
+            Action::Uncordon => Write::Patch(actions::schedulable(false)),
+            Action::Apply => {
+                let text = self.editor.read(cx).value().to_string();
+                match actions::apply(&text) {
+                    Ok(patch) => Write::Patch(patch),
+                    Err(error) => {
+                        // Refused here, before anything is sent: the reason
+                        // goes where the apiserver's would.
+                        self.apply_error = Some(kirikumo_ui::fetch::describe(&error));
+                        self.pending = Pending::Idle;
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        };
+        self.apply_error = None;
+        self.pending = Pending::Idle;
+        // A cluster-scoped kind is written without a namespace, whatever the
+        // detail was opened with.
+        let namespaced = self
+            .store
+            .read(cx)
+            .resource(&key.0)
+            .is_none_or(|resource| resource.namespaced);
+        let target = (
+            key.0.clone(),
+            key.1.clone().filter(|_| namespaced),
+            key.2.clone(),
+        );
+        self.editing = false;
+        self.editor_holds = None;
+        self.store
+            .update(cx, |store, cx| store.perform(target, write, cx));
+        cx.notify();
+    }
+
+    /// A button in the footer or the YAML strip.
+    ///
+    /// Greyed rather than hidden when it cannot be pressed: a control that
+    /// vanishes leaves the reader wondering whether the thing can be done at
+    /// all, and one that is grey with a tooltip says exactly why not.
+    fn button(
+        &self,
+        id: &'static str,
+        label: String,
+        enabled: bool,
+        destructive: bool,
+        cx: &mut Context<Self>,
+        act: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let tokens = Tokens::global(cx).clone();
+        let tip = rust_i18n::t!("action.forbidden").to_string();
+        div()
+            .id(id)
+            .px_2p5()
+            .py_1()
+            .flex_shrink_0()
+            .rounded(px(tokens.radius.control()))
+            .text_size(px(11.5))
+            .when(enabled && destructive, |this| {
+                this.cursor_pointer()
+                    .bg(tokens.colors().status_error.opacity(0.18))
+                    .text_color(tokens.colors().status_error)
+                    .hover(|this| this.bg(tokens.colors().status_error.opacity(0.3)))
+            })
+            .when(enabled && !destructive, |this| {
+                this.cursor_pointer()
+                    .bg(tokens.colors().bg_surface)
+                    .text_color(tokens.colors().text_primary)
+                    .hover(|this| this.bg(tokens.colors().surface_hover()))
+            })
+            .when(!enabled, |this| {
+                this.bg(tokens.colors().bg_surface.opacity(0.5))
+                    .text_color(tokens.colors().text_muted)
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
+            .child(label)
+            .when(enabled, |this| {
+                this.on_click(cx.listener(move |this, _, window, cx| act(this, window, cx)))
+            })
+    }
+
+    /// The actions strip at the foot of the panel: the first gesture, then
+    /// the second, then what the apiserver said.
+    fn footer(&self, object: &Object, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let tokens = Tokens::global(cx).clone();
+        let key = self.key.clone()?;
+        let resource = self.store.read(cx).resource(&key.0).cloned()?;
+        // Apply lives on the YAML tab, beside the text it applies.
+        let available: Vec<Action> = actions::available(&resource, object)
+            .into_iter()
+            .filter(|action| *action != Action::Apply)
+            .collect();
+        if available.is_empty() {
+            return None;
+        }
+        let write = self.store.read(cx).write(&key).cloned();
+        let working = write.as_ref().is_some_and(|write| write.is_loading());
+        let refused = self.apply_error.clone().or_else(|| {
+            write
+                .as_ref()
+                .and_then(|write| write.error())
+                .map(str::to_string)
+        });
+        let name = object.meta.name.clone();
+        let armed = self.pending.action();
+
+        let controls: Vec<AnyElement> = match armed {
+            None => available
+                .iter()
+                .map(|action| {
+                    let action = *action;
+                    let allowed = self.permission(action, cx) == Some(true);
+                    self.button(
+                        match action {
+                            Action::Scale => "act-scale",
+                            Action::Restart => "act-restart",
+                            Action::Cordon => "act-cordon",
+                            Action::Uncordon => "act-uncordon",
+                            Action::Apply => "act-apply",
+                            Action::Delete => "act-delete",
+                        },
+                        rust_i18n::t!(action.label_key()).to_string(),
+                        allowed && !working,
+                        action.is_destructive(),
+                        cx,
+                        move |this, _, cx| this.arm(action, cx),
+                    )
+                    .into_any_element()
+                })
+                .collect(),
+            Some(action) => {
+                let mut controls = Vec::new();
+                if action == Action::Scale {
+                    controls.push(
+                        div()
+                            .w(px(72.))
+                            .flex_shrink_0()
+                            .child(Input::new(&self.replicas))
+                            .into_any_element(),
+                    );
+                }
+                controls.push(
+                    self.button(
+                        "confirm",
+                        confirm_label(action, &name, self.pending.replicas()),
+                        self.pending.can_confirm() && !working,
+                        action.is_destructive(),
+                        cx,
+                        |this, window, cx| this.confirm(window, cx),
+                    )
+                    .into_any_element(),
+                );
+                controls.push(
+                    self.button(
+                        "cancel",
+                        rust_i18n::t!("action.cancel").to_string(),
+                        true,
+                        false,
+                        cx,
+                        |this, _, cx| this.disarm(cx),
+                    )
+                    .into_any_element(),
+                );
+                controls
+            }
+        };
+
+        Some(
+            v_flex()
+                .w_full()
+                .flex_shrink_0()
+                .border_t_1()
+                .border_color(tokens.colors().border_subtle)
+                .child(
                     h_flex()
                         .w_full()
-                        .h(LINE_HEIGHT)
                         .px_3()
-                        .gap_2()
+                        .py_2()
+                        .gap_1p5()
                         .items_center()
-                        .child(
-                            div()
-                                .w(gutter)
-                                .flex_shrink_0()
-                                .text_right()
-                                .text_size(px(11.))
-                                .font_family("monospace")
-                                .text_color(tokens.colors().text_muted)
-                                .child((index + 1).to_string()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(12.))
-                                .font_family("monospace")
-                                .text_color(tokens.colors().text_secondary)
-                                .child(line),
-                        )
-                })
-                .collect()
-        })
-        .size_full()
-        .into_any_element()
+                        .flex_wrap()
+                        .children(controls)
+                        .when(working, |this| {
+                            this.child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(tokens.colors().text_muted)
+                                    .child(rust_i18n::t!("action.working").to_string()),
+                            )
+                        }),
+                )
+                .children(refused.map(|error| {
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .text_size(px(11.5))
+                        .text_color(tokens.colors().status_error)
+                        .child(error)
+                }))
+                .into_any_element(),
+        )
     }
 
     /// The Logs tab: what to read, and then the reading of it.
@@ -802,7 +1195,7 @@ impl Detail {
 }
 
 impl Render for Detail {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(object) = self.object(cx) else {
             return v_flex()
                 .size_full()
@@ -815,13 +1208,15 @@ impl Render for Detail {
         let body = match self.tab {
             Tab::Overview => self.overview(&object, cx),
             Tab::Events => self.events(&object, cx),
-            Tab::Yaml => self.yaml(&object, cx),
+            Tab::Yaml => self.yaml(&object, window, cx),
             Tab::Logs => self.logs(cx),
         };
+        let footer = self.footer(&object, cx);
         v_flex()
             .size_full()
             .child(header)
             .child(tabs)
             .child(div().flex_1().min_h_0().w_full().child(body))
+            .children(footer)
     }
 }

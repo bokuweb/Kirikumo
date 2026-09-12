@@ -6,7 +6,8 @@
 //! ([`model`]), the rule that turns an object into a health mark
 //! ([`health`]), quantity parsing ([`quantity`]), the [`Cluster`] trait every
 //! view reaches a cluster through, its REST implementation ([`rest`]), the
-//! framing of a watch ([`watch`]), and a scripted fake ([`scripted`]).
+//! framing of a watch ([`watch`]), the few writes and what each becomes on
+//! the wire ([`actions`]), and a scripted fake ([`scripted`]).
 //!
 //! What does not live here: anything that knows a colour, a column or a
 //! window. This crate has no `gpui` dependency and never will
@@ -18,6 +19,7 @@
 //! the host that will one day own this window runs on `smol` and forbids a
 //! second async runtime (rule 3).
 
+pub mod actions;
 pub mod auth;
 pub mod discovery;
 pub mod error;
@@ -31,6 +33,7 @@ pub mod scripted;
 pub mod watch;
 pub mod yaml;
 
+pub use actions::Action;
 pub use error::{Error, Result};
 pub use health::{Health, Level};
 pub use kubeconfig::{KubeConfig, kubeconfig_paths};

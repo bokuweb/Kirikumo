@@ -1,7 +1,7 @@
 # Kirikumo UI Specification
 
 > Companion to [`roadmap.md`](roadmap.md). The roadmap says *what* we build and when; this document says *what it looks like* and *which components render it*. Where this document is silent, Ginka's `docs/ui.md` applies: the window, the tokens and the header strips are the same by design (roadmap §4.3, K5).
-> Last updated: 2026-09-07
+> Last updated: 2026-09-12
 
 ## 1. Design direction
 
@@ -86,16 +86,19 @@ A `uniform_list` of 28 px rows under a sticky header:
 
 Tabs under the header, as chips: **Overview**, **Events**, **YAML**, and **Logs** for anything with containers.
 
-- **Header** — the object's name at 15/500 in mono; under it the kind, the namespace, the health mark and its word. Then the actions the milestone allows, each of which takes two gestures (roadmap K6).
+- **Header** — the object's name at 15/500 in mono; under it the kind, the namespace, the health mark and its word.
 - **Overview** — the rows every object has (labels, created, the owner as a link that navigates the centre column, the uid muted), then, when `metrics.k8s.io` is installed and the kind has any, **Using**: CPU in milli-cores and memory in binary units, and for a node the share of its allocatable that is. A cluster with no metrics server gets no *Using* section at all rather than a row of zeroes — a pod using no CPU and a cluster nobody can ask look identical as zeroes and mean opposite things. Then what the kind adds: a Pod's node, IPs, QoS class and its containers with images, ports, restarts and state; a Deployment's strategy, replica counts and conditions; a Service's type, cluster IP, ports and selector; a Node's capacity, allocatable, conditions and kubelet version. A condition table is the shape `kubectl describe` prints, drawn as rows with the status as a mark.
 - **Events** — the object's own events, newest first: type as a mark, reason in mono, the message, the count and the age. *No events* is one muted line, and is normal.
-- **YAML** — the object as the apiserver sends it, mono, line-numbered, in one virtualized list. Read-only until M4; at M4 an *Edit* control turns it into an editor and *Apply* takes two gestures.
+- **YAML** — the object as the apiserver sends it, in the toolkit's editor with YAML highlighting: read-only, with a line under it saying so, until *Edit*. Editing makes the text the reader's — a watch event landing mid-edit does not replace it — and offers *Apply* and *Cancel* in the same strip. *Apply* takes two gestures like every write (the second says *Apply to name*), and a manifest that is not one — not YAML, not a mapping, no name — is refused here, with the reason where the apiserver's would go, before anything is sent.
 - **Logs** — the container picker as chips when there is more than one, then a toolbar — *Follow* (on by default), *Previous* (the instance before this one, which is the only place a crash loop's reason survives), and a find box — and under it the lines in a virtualized list.
   - **Find is literal, not fuzzy.** Every other box in this window is a fuzzy matcher; this one is `grep`, because a fuzzy match over a hundred thousand lines finds every line containing those letters in that order, which is every line. It *filters* rather than highlighting and stepping, and says `matched/total` beside itself so a filtered log is never mistaken for a short one.
   - **Following keeps the end in view**, and only moves the list when a line actually arrived, so it does not fight a reader who has taken hold of the scrollbar. Dropping follow automatically when they scroll up, and a *Jump to end* pill to restore it, are still owed.
   - **There is no wrap toggle**, and there will not be one until the list can have rows of different heights: a wrapped line is a taller row, and a virtualized list of uniform rows is what keeps a fifty-thousand-line scrollback cheap (roadmap §6). A long line scrolls sideways with the list.
   - The scrollback is bounded at 50 000 lines, oldest dropped first.
-- **Footer** — the actions strip, when the milestone has any.
+- **Footer — the actions strip.** The writes the object offers (roadmap M4): *Scale* and *Restart* for a controller, *Cordon* or *Uncordon* for a node, and *Delete* for anything the apiserver lets anyone delete — last, and in the error colour, where a hand does not fall on it. *Apply* is not here; it lives beside the text it applies.
+  - **Every write takes two gestures, and the second names the object.** Pressing *Delete* turns the strip into *Delete api-7d9f8c-2xk4t* and *Cancel*; pressing *Scale* adds a replica field, pre-filled with what the object has, and *Scale api to 2*. The name is on the button, in the same words `kubectl` would take, so the second press cannot be made without reading which object it is for. The reader does not type the name: that is `kubectl delete`'s weight, and it turns the one action a person makes under pressure into a spelling test.
+  - **A button this login may not press is grey, not gone**, with a tooltip saying so. The answer comes from `SelfSubjectAccessReview`, asked once per kind, namespace and verb; until it comes the button is grey too, because a control that is pressable for a second and then is not is worse than one that lights up.
+  - While the write is in flight the strip says *Working…*; a refusal is the apiserver's own words in `status.error` under the buttons. Nothing here is bound to a key, and nothing here is in the palette.
 
 Empty state: *Pick something to look at* over the glass.
 
@@ -122,8 +125,9 @@ It is the one list in the app **ranked by score** rather than left in its own or
 | Table | `gpui::uniform_list` with rows from `kirikumo_ui::table::Row`, our own header |
 | Pickers (context, namespace) | ours: a filter `Input` over a `uniform_list` in a `bg.raised` popover |
 | Palette | ours: the same, as a centred overlay over a click-to-dismiss scrim |
-| Filter box, log find | `gpui-component` `Input` |
-| YAML, logs | `gpui::uniform_list` of mono lines |
+| Filter box, log find, replica count | `gpui-component` `Input` |
+| YAML | `gpui-component` `Editor` with `tree-sitter-yaml`, read-only until *Edit* |
+| Logs | `gpui::uniform_list` of mono lines |
 | Tooltips, icons | `gpui-component` primitives; our SVGs in `assets/icons/` for what the toolkit lacks |
 
 ## 5. Interaction rules

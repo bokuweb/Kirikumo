@@ -125,8 +125,8 @@ pub struct Shell {
     pending_filter: Option<String>,
     /// Something to open once discovery has landed.
     open_at_launch: Option<Target>,
-    /// Whether to open it on its Logs tab.
-    logs_at_launch: bool,
+    /// Which tab to open it on, by name.
+    tab_at_launch: Option<String>,
     /// The appearance changed and the theme has to be installed at the next
     /// frame, which is the first place with a window to ask.
     retheme: bool,
@@ -268,7 +268,7 @@ impl Shell {
             open_palette_pending: false,
             pending_filter: None,
             open_at_launch: None,
-            logs_at_launch: false,
+            tab_at_launch: None,
             retheme: false,
             resizing: None,
             transitions: Vec::new(),
@@ -606,9 +606,9 @@ impl Shell {
     /// For demos and screenshots (`KIRIKUMO_DEMO_OPEN=Pod/shop/api-…`, the
     /// namespace empty for a cluster-scoped kind). Goes through the same path
     /// a link does, so it exercises what a reader would.
-    pub fn open_at_launch(&mut self, target: Target, logs: bool, cx: &mut Context<Self>) {
+    pub fn open_at_launch(&mut self, target: Target, tab: Option<String>, cx: &mut Context<Self>) {
         self.open_at_launch = Some(target);
-        self.logs_at_launch = logs;
+        self.tab_at_launch = tab;
         cx.notify();
     }
 
@@ -1062,9 +1062,9 @@ impl Render for Shell {
             && let Some(target) = self.open_at_launch.take()
         {
             self.navigate(target, cx);
-            if self.logs_at_launch {
-                self.logs_at_launch = false;
-                self.detail.update(cx, |detail, cx| detail.show_logs(cx));
+            if let Some(tab) = self.tab_at_launch.take() {
+                self.detail
+                    .update(cx, |detail, cx| detail.show_tab_named(&tab, cx));
             }
         }
         if self.open_palette_pending && self.store.read(cx).catalogue().value().is_some() {

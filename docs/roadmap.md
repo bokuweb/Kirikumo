@@ -1,7 +1,7 @@
 # Kirikumo Roadmap
 
 > The authoritative document for this repository. `AGENTS.md` is the short version; `docs/ui.md` says what it looks like.
-> Last updated: 2026-09-07
+> Last updated: 2026-09-12
 
 ## 1. Vision
 
@@ -187,7 +187,7 @@ Only what is on screen is watched, and a watch is dropped when its table is. A c
 
 ### 4.8 UI stack
 
-`gpui-component` over the `gpui` rev it owns, at exactly Ginka's and e1's lock (K4). Used from it: `Root`, `Icon`, `Input`, `Tooltip`, `TextView::markdown`, and `gpui::uniform_list` for every table. Built here: the header strips, the health marks, the table's own header and cells, the log view, the YAML view.
+`gpui-component` over the `gpui` rev it owns, at exactly Ginka's and e1's lock (K4), with its `tree-sitter-yaml` feature on. Used from it: `Root`, `Icon`, `Input`, `Tooltip`, `Editor` for the YAML tab, and `gpui::uniform_list` for every table. Built here: the header strips, the health marks, the table's own header and cells, the log view, the palette, the pickers.
 
 Before writing a widget, check `gpui-component`'s gallery for an existing one.
 
@@ -203,12 +203,13 @@ Before writing a widget, check `gpui-component`'s gallery for an existing one.
 - **The table is live.** The list on screen — and only that one — is watched: a thread reads the stream, bookmarks keep the resume point moving while nothing happens, a `410 Gone` re-lists and starts again, and a dropped connection backs off from a second to thirty. A change reaches the row without anybody pressing refresh, and only the rows whose objects moved are formatted again.
 - **A log can be followed.** The Logs tab tails a container and keeps reading, with a container picker, a *Previous* toggle for the instance before this one, and a literal find that filters and counts. The scrollback is bounded; the reading is a thread, like a watch's.
 - **The detail panel goes places.** A pod's controller and its node are links; a controller's and a service's selector is a link *down* to the pods it selects. And when `metrics.k8s.io` is installed, a pod or a node says what it is using — a node as a share of its allocatable.
+- **It can act, carefully.** Scale, restart, cordon and uncordon, delete, and apply an edited manifest — each reached from the object it acts on, each taking two gestures with the second naming the object, each greyed out when `SelfSubjectAccessReview` says this login may not. Nothing destructive is on a key or in the palette (K6).
 - **`⌘K` reaches everything by name** — every kind, every namespace, every context, and the four commands that are none of those — ranked by score, and holding nothing that can destroy anything.
 - **Switching context** rebuilds the connection and clears everything the last cluster said. An insecure connection says so in the sidebar.
 - **English and Japanese.** Every user-visible string is in `locales/app.yml` in both.
 - `KIRIKUMO_DEMO=1` runs the whole window over a scripted cluster with something wrong in it, and no network — including a scripted *watch*, so the demo shows a pod restarting, one arriving and one going away without a cluster anywhere.
 
-What is *not* there yet: any write at all, which is M4.
+What is *not* there yet: drain (cordon plus evicting every pod, honouring disruption budgets), exec and port-forward (M5), and the mounting into Ginka's window (M5).
 
 | # | Name | What lands | Owes |
 | --- | --- | --- | --- |
@@ -216,7 +217,7 @@ What is *not* there yet: any write at all, which is M4.
 | **M1** | Everything is a table | API discovery, the resource tree in the sidebar, one virtualized table for every kind with `kubectl`'s columns, the namespace picker, health marks, the detail's Overview, Events, YAML and Logs | **Landed.** Column sets beyond the built-in kinds — see Q5, which may make that debt disappear rather than be paid; sticky header under scroll |
 | **M2** | Live | Watches wired to the store with bookmarks and re-list, rows updated in place rather than rebuilt, `⌘F`/`⌘L`/`⌘K` | **Landed.** Backoff tuning against a real flaky apiserver rather than a scripted one |
 | **M3** | Pods in depth | Logs following, with find and the previous instance; `metrics.k8s.io` for nodes and pods; owner/child navigation | **Landed.** Wrapping long log lines (needs a variable-height virtualized list); dropping follow when the reader scrolls up; metrics in the *table* as well as the panel, which needs a column set that depends on what the cluster can answer |
-| **M4** | Acting | Delete, scale, restart, cordon/uncordon/drain, apply an edited YAML — each behind a confirmation, each greyed out when `SelfSubjectAccessReview` says no (K6) | |
+| **M4** | Acting | Delete, scale, restart, cordon/uncordon, apply an edited YAML — each behind a confirmation that names the object, each greyed out when `SelfSubjectAccessReview` says no (K6) | **Landed**, except **drain**: cordon and then evict every pod through the Eviction API, honouring disruption budgets and skipping what a DaemonSet or the kubelet owns. A loop with policy in it, worth its own change. |
 | **M5** | In Ginka's window | `ClusterPanel` mounted as a surface, the `Cluster` implementation that proxies through Ginka's daemon, and exec/port-forward over WebSocket if Q2 says yes | |
 
 ## 6. Quality bars
@@ -256,3 +257,9 @@ What is *not* there yet: any write at all, which is M4.
 | 2026-09-07 | The log's find box is literal, not fuzzy — the only box in the window that is | Fuzzy matching over a hundred thousand lines finds every line containing those letters in that order, which is every line. What people do to a log is `grep`, and a filter with a `matched/total` count beside it is that. Highlighting and stepping through matches was the alternative; it needs styled runs inside a line and scroll targeting, and answers a question — "where is the next one?" — that filtering makes not arise. |
 | 2026-09-07 | No wrap toggle for logs until the list can have rows of different heights | A wrapped line is a taller row, and the whole reason a fifty-thousand-line scrollback is affordable is that every row is the same height (rule 7). Wrapping by dropping virtualization for the wrapped case would put four thousand elements on screen, which is the thing rule 7 exists to prevent. So: a long line scrolls sideways, and wrapping waits for a variable-height list. |
 | 2026-09-07 | A log's scrollback is bounded at 50 000 lines, oldest first | A pod that has been logging for a week would otherwise be held whole in a window nobody closed. Oldest first because the reason anyone follows a log is what happens next. The same shape as a terminal's scrollback in Ginka. |
+| 2026-09-12 | The second gesture is a button that names the object, not a field the name is typed into | Typing the name is `kubectl delete`'s weight, and it turns the one action a person makes under pressure into a spelling test. What the safeguard has to achieve is that the second press cannot be made without reading which object it is for; the name on the button, in mono, achieves that. K6 is satisfied by the gesture count and the naming, not by friction. |
+| 2026-09-12 | A button this login may not press is grey with a reason, not hidden; and *unknown* is drawn as grey too | Hidden leaves the reader wondering whether the thing can be done at all. Grey with *Not allowed for this login* says exactly why not. And while the `SelfSubjectAccessReview` is in flight the button stays grey, because a control that is pressable for a second and then is not is worse than one that lights up. A cluster that cannot answer the review at all is taken as a yes and the write itself is left to be the judge. |
+| 2026-09-12 | The YAML tab is the toolkit's editor, and `tree-sitter-yaml` is the one language feature switched on | Rule: check the gallery before writing a widget. The editor gives line numbers, highlighting, undo and selection for free, and replaces the hand-rolled virtualized list of lines. The feature adds three `tree-sitter` crates and a C build; it is additive, so it costs Ginka nothing until these views are mounted, and then only YAML. |
+| 2026-09-12 | *Apply* lives on the YAML tab, beside the text; every other write lives in the footer | The thing being applied is on screen in exactly one place, and the button belongs next to it. Putting *Apply* in the footer would mean a reader on the Overview tab could apply an edit they cannot see. |
+| 2026-09-12 | The scripted cluster accepts writes, with a JSON merge patch of its own | So that a demo delete or scale is real and the two gestures can be watched to do something, with no cluster to break. Its strategic merge is a plain merge, which is right for every patch this app sends (none touches a list) and wrong in general; the fake says so in its rustdoc rather than pretending. |
+| 2026-09-12 | Drain is deferred out of M4 | It is the one write that is a *loop with policy in it*: cordon, list the node's pods, skip what a DaemonSet or the kubelet owns, evict each through the Eviction API, and wait on a disruption budget that says no. That is a change of its own with its own tests, not a sixth button. |

@@ -15,7 +15,7 @@ use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
     ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, LogRequest,
-    Metrics, Object, ObjectList, ResourceKey, WatchEvent, logs, watch,
+    Metrics, Object, ObjectList, Patch, ResourceKey, WatchEvent, logs, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
@@ -28,6 +28,19 @@ pub type ListKey = (ResourceKey, Option<String>);
 
 /// Which object: a kind, a namespace and a name.
 pub type ObjectKey = (ResourceKey, Option<String>, String);
+
+/// A write, ready to send.
+///
+/// Built by the detail panel from `kirikumo_kube::actions` and carried here
+/// whole, so the store knows nothing about *why* — only that it is a delete
+/// or a patch, which is all the trait knows either.
+#[derive(Debug, Clone)]
+pub enum Write {
+    /// Remove the object.
+    Delete,
+    /// Change it.
+    Patch(Patch),
+}
 
 /// Emitted whenever an answer lands.
 pub enum StoreEvent {
@@ -62,6 +75,12 @@ pub struct Store {
     node_metrics: Fetch<Vec<Metrics>>,
     /// What every pod in a namespace is using, likewise, by namespace.
     pod_metrics: HashMap<Option<String>, Fetch<Vec<Metrics>>>,
+    /// Whether this login may do a verb on a kind in a namespace, per
+    /// `SelfSubjectAccessReview`. Asked once per triple and kept: RBAC does
+    /// not change under a window often enough to be worth asking again.
+    permissions: HashMap<(ResourceKey, Option<String>, String), Fetch<bool>>,
+    /// The last write on each object: in flight, done, or refused.
+    writes: HashMap<ObjectKey, Fetch<()>>,
     /// The list the window is looking at, and so the only one worth
     /// following. A cluster with ten thousand pods must not be streamed
     /// because the sidebar mentions pods (roadmap §4.7).
@@ -118,6 +137,8 @@ impl Store {
             log_generation: 0,
             node_metrics: Fetch::Idle,
             pod_metrics: HashMap::new(),
+            permissions: HashMap::new(),
+            writes: HashMap::new(),
             followed: None,
             watch: None,
             generation: 0,
@@ -185,6 +206,8 @@ impl Store {
         self.logs.clear();
         self.node_metrics = Fetch::Idle;
         self.pod_metrics.clear();
+        self.permissions.clear();
+        self.writes.clear();
         self.stop_watch();
         self.followed = None;
         cx.emit(StoreEvent::Changed);
@@ -650,6 +673,107 @@ impl Store {
             _ => return None,
         };
         held.iter().find(|metrics| metrics.name == name)
+    }
+
+    /// Whether this login may do a verb on a kind, if the cluster has said.
+    ///
+    /// `None` while it is being asked, which the panel draws the same way as
+    /// `false`: a button that lights up when the answer is yes is better than
+    /// one that is pressable for a second and then is not.
+    pub fn permission(
+        &self,
+        key: &ResourceKey,
+        namespace: Option<&str>,
+        verb: &str,
+    ) -> Option<bool> {
+        self.permissions
+            .get(&(key.clone(), namespace.map(str::to_string), verb.to_string()))
+            .and_then(|fetch| fetch.value())
+            .copied()
+    }
+
+    /// Ask whether this login may do a verb on a kind, once.
+    pub fn ensure_permission(
+        &mut self,
+        key: ResourceKey,
+        namespace: Option<String>,
+        verb: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let stored = (key.clone(), namespace.clone(), verb.to_string());
+        if self
+            .permissions
+            .get(&stored)
+            .is_some_and(|fetch| !fetch.is_idle())
+        {
+            return;
+        }
+        let Some(resource) = self.resource(&key).cloned() else {
+            return;
+        };
+        self.permissions.entry(stored.clone()).or_default().begin();
+        self.fetch(
+            cx,
+            move |cluster| cluster.can_i(&resource, namespace.as_deref(), verb),
+            move |this, result, _| {
+                // A cluster that cannot be asked — an aggregated apiserver
+                // with no authorization endpoint — is taken as a yes, and the
+                // write itself is left to be the judge.
+                let answer = result.or_else(|error| {
+                    tracing::debug!(%error, "could not ask about permissions; assuming yes");
+                    Ok::<bool, String>(true)
+                });
+                this.permissions.entry(stored).or_default().finish(answer);
+            },
+        );
+    }
+
+    /// The last write on an object, if there has been one.
+    pub fn write(&self, object: &ObjectKey) -> Option<&Fetch<()>> {
+        self.writes.get(object)
+    }
+
+    /// Send a write, and when it lands, list the kind again.
+    ///
+    /// Listing again rather than patching what is held: the answer to a write
+    /// is one object, and what the reader is looking at is the list, whose
+    /// other rows the write may have moved (a scale makes pods). A watch
+    /// would bring the change anyway; the re-list is for a cluster without
+    /// one, and costs one request.
+    pub fn perform(&mut self, object: ObjectKey, write: Write, cx: &mut Context<Self>) {
+        let (key, namespace, name) = object.clone();
+        let Some(resource) = self.resource(&key).cloned() else {
+            return;
+        };
+        self.writes.entry(object.clone()).or_default().begin();
+        let scope = namespace;
+        self.fetch(
+            cx,
+            move |cluster| match write {
+                Write::Delete => cluster.delete(&resource, scope.as_deref(), &name),
+                Write::Patch(patch) => cluster
+                    .patch(&resource, scope.as_deref(), &name, patch)
+                    .map(|_| ()),
+            },
+            move |this, result, cx| {
+                let landed = result.is_ok();
+                this.writes.entry(object).or_default().finish(result);
+                if landed {
+                    // Every list of the kind, not just the one scoped like
+                    // the object: the table may be showing all namespaces
+                    // while the object was opened in one of them.
+                    let held: Vec<ListKey> = this
+                        .lists
+                        .keys()
+                        .filter(|(kind, _)| *kind == key)
+                        .cloned()
+                        .collect();
+                    for (kind, scope) in held {
+                        this.load_list(kind, scope.as_deref(), cx);
+                    }
+                }
+            },
+        );
     }
 
     /// Ask the cluster who it is, what it serves and what namespaces it has.

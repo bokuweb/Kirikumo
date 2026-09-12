@@ -30,7 +30,11 @@ kirikumo-views = { path = "crates/kirikumo-views" }
 # (docs/roadmap.md §4.3): two revs of `gpui` are two unrelated sets of types.
 gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+# `tree-sitter-yaml` is the one language feature switched on: the YAML tab is
+# the toolkit's editor, and a manifest with its keys and values told apart is
+# a manifest a person can read. Features are additive across the family, so
+# this costs Ginka nothing until it mounts these views, and then only YAML.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["tree-sitter-yaml"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 
 anyhow = "1"
