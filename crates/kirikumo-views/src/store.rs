@@ -14,8 +14,8 @@
 use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
-    ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, LogRequest,
-    Metrics, Object, ObjectList, Patch, ResourceKey, WatchEvent, drain, logs, watch,
+    ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, Forwarder,
+    LogRequest, Metrics, Object, ObjectList, Patch, ResourceKey, WatchEvent, drain, logs, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
@@ -85,6 +85,9 @@ pub struct Store {
     /// that landed carries a line to show — empty for most, and a drain's
     /// report for a drain.
     writes: HashMap<ObjectKey, Fetch<String>>,
+    /// Every local port being forwarded to a pod. Dropped with the store, or
+    /// on a change of context: a forward is a hole into one cluster.
+    forwards: Vec<ActiveForward>,
     /// The list the window is looking at, and so the only one worth
     /// following. A cluster with ten thousand pods must not be streamed
     /// because the sidebar mentions pods (roadmap §4.7).
@@ -94,6 +97,23 @@ pub struct Store {
     /// Bumped for every watch started, so an event from one that has been
     /// abandoned is recognised and dropped.
     generation: u64,
+}
+
+/// A local port being forwarded to a pod.
+pub struct ActiveForward {
+    /// Which pod.
+    pub pod: ObjectKey,
+    /// The port on the pod.
+    pub remote: u16,
+    /// The listener, which stops when this is dropped.
+    pub forwarder: Forwarder,
+}
+
+impl ActiveForward {
+    /// The port on `localhost`.
+    pub fn local(&self) -> u16 {
+        self.forwarder.local_port()
+    }
 }
 
 /// A log being followed, and the way to tell it to stop.
@@ -143,6 +163,7 @@ impl Store {
             pod_metrics: HashMap::new(),
             permissions: HashMap::new(),
             writes: HashMap::new(),
+            forwards: Vec::new(),
             followed: None,
             watch: None,
             generation: 0,
@@ -212,6 +233,9 @@ impl Store {
         self.pod_metrics.clear();
         self.permissions.clear();
         self.writes.clear();
+        // Dropping a forwarder stops it: nothing from the last cluster may
+        // stay reachable on `localhost` under the new one's name.
+        self.forwards.clear();
         self.stop_watch();
         self.followed = None;
         cx.emit(StoreEvent::Changed);
@@ -794,6 +818,76 @@ impl Store {
                 }
             },
         );
+    }
+
+    /// The forwards open to one pod.
+    pub fn forwards_for<'a>(
+        &'a self,
+        pod: &'a ObjectKey,
+    ) -> impl Iterator<Item = &'a ActiveForward> {
+        self.forwards
+            .iter()
+            .filter(move |forward| &forward.pod == pod)
+    }
+
+    /// How many forwards are open, to any pod.
+    pub fn forward_count(&self) -> usize {
+        self.forwards.len()
+    }
+
+    /// Forward a local port to a port on a pod.
+    ///
+    /// The same number is tried on `localhost` first, because `8080 → 8080`
+    /// is what a person expects; when it is taken, any free port is used and
+    /// the answer says which. Binding is immediate; the tunnel to the
+    /// apiserver is opened per connection, on that connection's thread, so
+    /// this returns before anything has been sent to the cluster.
+    pub fn start_forward(
+        &mut self,
+        pod: ObjectKey,
+        remote: u16,
+        cx: &mut Context<Self>,
+    ) -> Result<u16, String> {
+        if let Some(existing) = self
+            .forwards
+            .iter()
+            .find(|forward| forward.pod == pod && forward.remote == remote)
+        {
+            return Ok(existing.local());
+        }
+        let (_, namespace, name) = pod.clone();
+        let namespace = namespace.unwrap_or_default();
+        let cluster = self.cluster.clone();
+        let connect = move || cluster.port_forward(&namespace, &name, remote);
+        let forwarder = match Forwarder::serve(remote, connect) {
+            Ok(forwarder) => forwarder,
+            Err(_) => {
+                // The same closure again, for any free port.
+                let (_, namespace, name) = pod.clone();
+                let namespace = namespace.unwrap_or_default();
+                let cluster = self.cluster.clone();
+                Forwarder::serve(0, move || cluster.port_forward(&namespace, &name, remote))
+                    .map_err(|error| describe(&error))?
+            }
+        };
+        let local = forwarder.local_port();
+        tracing::info!(local, remote, pod = %pod.2, "forwarding");
+        self.forwards.push(ActiveForward {
+            pod,
+            remote,
+            forwarder,
+        });
+        cx.emit(StoreEvent::Changed);
+        cx.notify();
+        Ok(local)
+    }
+
+    /// Stop forwarding to a port on a pod.
+    pub fn stop_forward(&mut self, pod: &ObjectKey, remote: u16, cx: &mut Context<Self>) {
+        self.forwards
+            .retain(|forward| !(&forward.pod == pod && forward.remote == remote));
+        cx.emit(StoreEvent::Changed);
+        cx.notify();
     }
 
     /// Ask the cluster who it is, what it serves and what namespaces it has.

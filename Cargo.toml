@@ -57,6 +57,15 @@ thiserror = "2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The WebSocket a port-forward is, opened with the synchronous client over a
+# socket of ours, because an upgrade is not a request `ureq` can make. The
+# same crate Ginka links for Slack, at the same version.
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# `rustls` directly, for the one configuration `ureq` does not build for us:
+# the WebSocket's. `ring` named explicitly, because `ureq` uses `ring` and two
+# providers in one binary is what `rustls` refuses to guess between.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 # Blocking HTTPS over rustls, run on GPUI's background executor, with the
 # client certificates and private roots a kubeconfig hands us. Chosen over an
 # async client because every async client on crates.io brings tokio, and Ginka

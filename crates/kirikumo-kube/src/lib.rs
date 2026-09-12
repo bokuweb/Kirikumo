@@ -7,7 +7,8 @@
 //! ([`health`]), quantity parsing ([`quantity`]), the [`Cluster`] trait every
 //! view reaches a cluster through, its REST implementation ([`rest`]), the
 //! framing of a watch ([`watch`]), the few writes and what each becomes on
-//! the wire ([`actions`]), and a scripted fake ([`scripted`]).
+//! the wire ([`actions`], [`drain`]), a port forwarded to a pod
+//! ([`portforward`], over [`tls`]), and a scripted fake ([`scripted`]).
 //!
 //! What does not live here: anything that knows a colour, a column or a
 //! window. This crate has no `gpui` dependency and never will
@@ -28,9 +29,11 @@ pub mod health;
 pub mod kubeconfig;
 pub mod logs;
 pub mod model;
+pub mod portforward;
 pub mod quantity;
 pub mod rest;
 pub mod scripted;
+pub mod tls;
 pub mod watch;
 pub mod yaml;
 
@@ -43,6 +46,7 @@ pub use model::{
     ApiResource, Catalogue, ClusterVersion, ContextRef, EventRecord, Group, LogRequest, Metrics,
     Object, ObjectList, ObjectMeta, OwnerRef, Patch, ResourceKey,
 };
+pub use portforward::{Forwarder, Tunnel};
 pub use rest::Rest;
 pub use scripted::Scripted;
 pub use watch::{Applied, WatchEvent, WatchStream};
@@ -126,6 +130,15 @@ pub trait Cluster: Send + Sync {
         _name: &str,
         _patch: Patch,
     ) -> Result<Object> {
+        Err(Error::Unsupported)
+    }
+
+    /// Open one connection to a port on a pod.
+    ///
+    /// Called once per local connection by [`portforward::Forwarder`], on
+    /// that connection's thread; see [`portforward`] for why it is one
+    /// tunnel per connection.
+    fn port_forward(&self, _namespace: &str, _pod: &str, _port: u16) -> Result<Box<dyn Tunnel>> {
         Err(Error::Unsupported)
     }
 

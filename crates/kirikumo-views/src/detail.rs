@@ -92,6 +92,8 @@ pub struct Detail {
     editor_holds: Option<(ObjectKey, String)>,
     /// Why an edited manifest was refused before it was sent, if it was.
     apply_error: Option<String>,
+    /// Why the last forward could not be started, if it could not.
+    forward_error: Option<String>,
 }
 
 impl Detail {
@@ -149,6 +151,7 @@ impl Detail {
             editing: false,
             editor_holds: None,
             apply_error: None,
+            forward_error: None,
         }
     }
 
@@ -166,6 +169,7 @@ impl Detail {
         self.pending = Pending::Idle;
         self.editing = false;
         self.apply_error = None;
+        self.forward_error = None;
         self.stop_following(cx);
         self.ensure(cx);
         cx.notify();
@@ -505,6 +509,7 @@ impl Detail {
                             )
                     }))
             }))
+            .when(kind == "Pod", |this| this.child(self.forwards(object, cx)))
             .when(!overview.conditions.is_empty(), |this| {
                 this.child(
                     v_flex()
@@ -551,6 +556,141 @@ impl Detail {
                         })),
                 )
             })
+            .into_any_element()
+    }
+
+    /// Start a forward, remembering why it could not be if it could not.
+    fn start_forward(&mut self, remote: u16, cx: &mut Context<Self>) {
+        let Some(key) = self.key.clone() else {
+            return;
+        };
+        self.forward_error = self
+            .store
+            .update(cx, |store, cx| store.start_forward(key, remote, cx))
+            .err();
+        cx.notify();
+    }
+
+    /// The pod's ports, and the forwards open to them.
+    ///
+    /// Not a write in K6's sense — nothing in the cluster changes — but it
+    /// opens a port on this machine, so it is one deliberate click on a
+    /// chip that names the port, and the strip says what is open.
+    fn forwards(&self, object: &Object, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Tokens::global(cx).clone();
+        let key = self.key.clone();
+        let ports = detail::container_ports(object);
+        let active: Vec<(u16, u16, usize, Option<String>)> = key
+            .as_ref()
+            .map(|key| {
+                self.store
+                    .read(cx)
+                    .forwards_for(key)
+                    .map(|forward| {
+                        (
+                            forward.remote,
+                            forward.local(),
+                            forward.forwarder.open_connections(),
+                            forward.forwarder.last_error(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        v_flex()
+            .w_full()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(tokens.colors().text_muted)
+                    .child(rust_i18n::t!("detail.forward").to_string()),
+            )
+            .when(ports.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(tokens.colors().text_muted)
+                        .child(rust_i18n::t!("detail.forward_none").to_string()),
+                )
+            })
+            .when(!ports.is_empty(), |this| {
+                this.child(h_flex().gap_1().flex_wrap().children(ports.into_iter().map(
+                    |(remote, label)| {
+                        let forwarding = active.iter().any(|(port, ..)| *port == remote);
+                        self.button(
+                            "forward-port",
+                            label,
+                            !forwarding,
+                            false,
+                            cx,
+                            move |this, _, cx| this.start_forward(remote, cx),
+                        )
+                    },
+                )))
+            })
+            .children(active.into_iter().map(|(remote, local, open, error)| {
+                let address = format!("localhost:{local}");
+                let copied = address.clone();
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .font_family("monospace")
+                            .text_color(tokens.colors().text_secondary)
+                            .truncate()
+                            .child(format!("{address} → {remote}")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(match error.is_some() {
+                                true => tokens.colors().status_error,
+                                false => tokens.colors().text_muted,
+                            })
+                            .child(match error {
+                                Some(error) => error,
+                                None => {
+                                    rust_i18n::t!("detail.forward_open", count = open).to_string()
+                                }
+                            }),
+                    )
+                    .child(self.button(
+                        "forward-copy",
+                        rust_i18n::t!("detail.forward_copy").to_string(),
+                        true,
+                        false,
+                        cx,
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                        },
+                    ))
+                    .child(self.button(
+                        "forward-stop",
+                        rust_i18n::t!("detail.forward_stop").to_string(),
+                        true,
+                        false,
+                        cx,
+                        move |this, _, cx| {
+                            if let Some(key) = this.key.clone() {
+                                this.store
+                                    .update(cx, |store, cx| store.stop_forward(&key, remote, cx));
+                            }
+                        },
+                    ))
+            }))
+            .children(self.forward_error.clone().map(|error| {
+                div()
+                    .text_size(px(11.5))
+                    .text_color(tokens.colors().status_error)
+                    .child(error)
+            }))
             .into_any_element()
     }
 

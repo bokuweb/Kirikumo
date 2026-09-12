@@ -140,6 +140,24 @@ detail.previous:
 detail.find:
   en: Find
   ja: 検索
+detail.forward:
+  en: Port forward
+  ja: ポートフォワード
+detail.forward_hint:
+  en: Pick a port to forward it to localhost.
+  ja: ポートを選ぶと localhost に転送します。
+detail.forward_none:
+  en: This pod declares no ports.
+  ja: この pod はポートを宣言していません。
+detail.forward_open:
+  en: "%{count} open"
+  ja: "%{count} 接続"
+detail.forward_copy:
+  en: Copy
+  ja: コピー
+detail.forward_stop:
+  en: Stop
+  ja: 停止
 detail.yaml_readonly:
   en: As the apiserver holds it. Edit to change it.
   ja: apiserver が保持している内容です。変更するには「編集」を押してください。

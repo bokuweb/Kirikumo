@@ -13,9 +13,12 @@ dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
+rustls.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tungstenite.workspace = true
 ureq.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

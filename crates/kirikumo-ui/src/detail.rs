@@ -516,6 +516,42 @@ fn keys(object: &Object) -> Vec<Section> {
     }
 }
 
+/// The ports a pod's containers declare, as chips to forward to.
+///
+/// `containerPort` with its name when it has one, in the order the manifest
+/// lists them and without duplicates — two containers may well both declare
+/// 8080, and one chip is enough to forward it.
+pub fn container_ports(object: &Object) -> Vec<(u16, String)> {
+    let mut ports: Vec<(u16, String)> = Vec::new();
+    for container in object.array_at("spec.containers") {
+        for port in container
+            .get("ports")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let Some(number) = port
+                .get("containerPort")
+                .and_then(Value::as_u64)
+                .and_then(|number| u16::try_from(number).ok())
+            else {
+                continue;
+            };
+            if ports.iter().any(|(known, _)| *known == number) {
+                continue;
+            }
+            let label = port
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("{name} {number}"))
+                .unwrap_or_else(|| number.to_string());
+            ports.push((number, label));
+        }
+    }
+    ports
+}
+
 /// The conditions, with the mark each one gets.
 ///
 /// `Ready=False` is an error and `Ready=Unknown` is too, but the negative
@@ -905,6 +941,25 @@ mod tests {
             now(),
         );
         assert_eq!(linked(&overview, "CPU").value, "100m");
+    }
+
+    #[test]
+    fn a_pods_container_ports_become_chips_named_when_the_manifest_names_them() {
+        let pod = object(json!({
+            "metadata": {"name": "api", "namespace": "shop"},
+            "spec": {"containers": [
+                {"name": "api", "ports": [{"containerPort": 8080, "name": "http"},
+                                          {"containerPort": 9090}]},
+                {"name": "proxy", "ports": [{"containerPort": 8080, "name": "http"}]}
+            ]}
+        }));
+        assert_eq!(
+            container_ports(&pod),
+            vec![(8080, "http 8080".to_string()), (9090, "9090".to_string())]
+        );
+        let none =
+            object(json!({"metadata": {"name": "x"}, "spec": {"containers": [{"name": "a"}]}}));
+        assert!(container_ports(&none).is_empty());
     }
 
     #[test]

@@ -20,12 +20,17 @@ use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
     Patch,
 };
+use crate::portforward::{self, Poll, Tunnel};
 use crate::watch::{JsonLines, WatchStream};
 use crate::{Cluster, quantity};
 use serde_json::Value;
 use std::io::BufReader;
+use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
+use tungstenite::client::IntoClientRequest as _;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Connector, Message, WebSocket};
 use ureq::tls::{Certificate, ClientCert, PemItem, PrivateKey, RootCerts, TlsConfig};
 
 /// How long one ordinary request may take.
@@ -535,6 +540,81 @@ impl Cluster for Rest {
         Object::new(value)
     }
 
+    fn port_forward(&self, namespace: &str, pod: &str, port: u16) -> Result<Box<dyn Tunnel>> {
+        let credential = self.auth.credential()?;
+        let tls = crate::tls::client_config(&self.access, credential.client_cert.as_ref())?;
+
+        // `https://host:port` becomes `wss://host:port/...`. The apiserver
+        // speaks WebSocket on the same listener as everything else.
+        let (host, tcp_port) = host_and_port(&self.base)?;
+        let url = format!(
+            "{}/api/v1/namespaces/{namespace}/pods/{pod}/portforward?ports={port}",
+            self.base
+                .replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1)
+        );
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| Error::Transport(format!("port-forward: {error}")))?;
+        let headers = request.headers_mut();
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            portforward::PROTOCOL
+                .parse()
+                .map_err(|_| Error::Transport("a protocol header".into()))?,
+        );
+        if let Some(header) = credential.header {
+            headers.insert(
+                "Authorization",
+                header
+                    .parse()
+                    .map_err(|_| Error::Credentials("the credential is not a header".into()))?,
+            );
+        }
+
+        let socket = TcpStream::connect((host.as_str(), tcp_port))
+            .map_err(|error| Error::Transport(format!("port-forward: {error}")))?;
+        let (ws, _response) = tungstenite::client_tls_with_config(
+            request,
+            socket,
+            None,
+            Some(Connector::Rustls(tls)),
+        )
+        .map_err(|error| match error {
+            // The apiserver answered the upgrade with a status rather than
+            // a switch: a 403 for a login that may not forward, a 404 for a
+            // pod that is not there. Its `Status` body says which.
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
+                Error::from_status(
+                    response.status().as_u16(),
+                    &response
+                        .body()
+                        .as_ref()
+                        .map(|body| String::from_utf8_lossy(body).into_owned())
+                        .unwrap_or_default(),
+                )
+            }
+            other => Error::Transport(format!("port-forward: {other}")),
+        })?;
+
+        // The pump takes turns between the pod and the local side on one
+        // thread, so a read that would block for ever has to give up after
+        // a short while instead.
+        match ws.get_ref() {
+            MaybeTlsStream::Rustls(stream) => {
+                stream.sock.set_read_timeout(Some(portforward::POLL))?;
+            }
+            MaybeTlsStream::Plain(stream) => {
+                stream.set_read_timeout(Some(portforward::POLL))?;
+            }
+            _ => {}
+        }
+        Ok(Box::new(WsTunnel {
+            ws,
+            opened: [false; 2],
+        }))
+    }
+
     fn evict(&self, namespace: &str, name: &str) -> Result<()> {
         let eviction = serde_json::json!({
             "apiVersion": "policy/v1",
@@ -573,6 +653,105 @@ impl Cluster for Rest {
             .pointer("/status/allowed")
             .and_then(Value::as_bool)
             .unwrap_or(false))
+    }
+}
+
+/// The host and port an apiserver URL names.
+fn host_and_port(base: &str) -> Result<(String, u16)> {
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .ok_or_else(|| Error::Config(format!("the server is not http(s): {base}")))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        // `[::1]:6443` and `host:6443`; a bare IPv6 address has colons and
+        // no port, which the bracket check tells apart.
+        Some((host, port)) if !host.contains(']') || host.ends_with(']') => (
+            host.trim_matches(|c| c == '[' || c == ']').to_string(),
+            port.parse::<u16>()
+                .map_err(|_| Error::Config(format!("the server's port: {base}")))?,
+        ),
+        _ => (
+            authority.trim_matches(|c| c == '[' || c == ']').to_string(),
+            match base.starts_with("https://") {
+                true => 443,
+                false => 80,
+            },
+        ),
+    };
+    Ok((host, port))
+}
+
+/// One WebSocket to the apiserver, carrying one port.
+///
+/// The first message on each channel opens with the port number
+/// (`portforward::opening_port`); it is stripped once per channel and never
+/// handed to the local program.
+struct WsTunnel {
+    ws: WebSocket<MaybeTlsStream<TcpStream>>,
+    /// Whether each channel's opening port message has been seen.
+    opened: [bool; 2],
+}
+
+impl Tunnel for WsTunnel {
+    fn poll(&mut self) -> Result<Poll> {
+        match self.ws.read() {
+            Ok(Message::Binary(bytes)) => {
+                let Some((channel, payload)) = portforward::parse_frame(&bytes) else {
+                    return Ok(Poll::Nothing);
+                };
+                let index = usize::from(channel);
+                let payload = match self.opened.get(index) {
+                    Some(false) => {
+                        self.opened[index] = true;
+                        portforward::opening_port(payload)
+                            .map(|(_, rest)| rest)
+                            .unwrap_or(payload)
+                    }
+                    _ => payload,
+                };
+                match channel {
+                    portforward::DATA if payload.is_empty() => Ok(Poll::Nothing),
+                    portforward::DATA => Ok(Poll::Data(payload.to_vec())),
+                    // The apiserver's word on why the port is not there.
+                    portforward::ERROR if payload.is_empty() => Ok(Poll::Nothing),
+                    portforward::ERROR => Err(Error::Transport(
+                        String::from_utf8_lossy(payload).into_owned(),
+                    )),
+                    _ => Ok(Poll::Nothing),
+                }
+            }
+            Ok(Message::Close(_)) => Ok(Poll::Closed),
+            // Pings are answered by the library on the next read or write.
+            Ok(_) => Ok(Poll::Nothing),
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(Poll::Nothing)
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                Ok(Poll::Closed)
+            }
+            Err(error) => Err(Error::Transport(format!("port-forward: {error}"))),
+        }
+    }
+
+    fn send(&mut self, data: &[u8]) -> Result<()> {
+        self.ws
+            .send(Message::Binary(
+                portforward::frame(portforward::DATA, data).into(),
+            ))
+            .map_err(|error| Error::Transport(format!("port-forward: {error}")))
+    }
+
+    fn close(&mut self) {
+        let _ = self.ws.close(None);
+        // Flush the close frame; a peer that never sees it keeps the
+        // channel's port reserved until its own timeout.
+        let _ = self.ws.flush();
     }
 }
 
@@ -619,6 +798,23 @@ mod tests {
             rest.events_path("abc", None),
             "/api/v1/events?fieldSelector=involvedObject.uid=abc"
         );
+    }
+
+    #[test]
+    fn an_apiservers_url_yields_its_host_and_port() {
+        assert_eq!(
+            host_and_port("https://127.0.0.1:6443").unwrap(),
+            ("127.0.0.1".to_string(), 6443)
+        );
+        assert_eq!(
+            host_and_port("https://api.example.com").unwrap(),
+            ("api.example.com".to_string(), 443)
+        );
+        assert_eq!(
+            host_and_port("https://[::1]:6443/").unwrap(),
+            ("::1".to_string(), 6443)
+        );
+        assert!(host_and_port("ftp://x").is_err());
     }
 
     #[test]

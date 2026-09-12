@@ -23,6 +23,7 @@ use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
     Patch, ResourceKey,
 };
+use crate::portforward::{Echo, Tunnel};
 use crate::watch::{WatchEvent, WatchStream};
 use crate::{Cluster, discovery};
 use chrono::{Duration, Utc};
@@ -504,6 +505,19 @@ impl Cluster for Scripted {
         Ok(())
     }
 
+    /// A forwarded port on the demo cluster is an echo on `localhost`:
+    /// enough to see the mechanism work with nothing behind it.
+    fn port_forward(&self, namespace: &str, pod: &str, _port: u16) -> Result<Box<dyn Tunnel>> {
+        let pods = self
+            .catalogue
+            .get(&ResourceKey::new("", "Pod"))
+            .cloned()
+            .ok_or_else(|| Error::NotFound("pods".into()))?;
+        // The pod has to exist, as it would have to on a cluster.
+        self.get(&pods, Some(namespace), pod)?;
+        Ok(Box::new(Echo::new()))
+    }
+
     fn evict(&self, namespace: &str, name: &str) -> Result<()> {
         if self.protected.contains(&format!("{namespace}/{name}")) {
             return Err(Error::Api {
@@ -710,7 +724,9 @@ fn pod_running(
         "spec": {"nodeName": node,
                  "containers": (0..total).map(|index| json!({
                      "name": format!("c{index}"),
-                     "image": "ghcr.io/shop/service:1.4"
+                     "image": "ghcr.io/shop/service:1.4",
+                     // A port to forward to, so the demo has a chip to press.
+                     "ports": [{"containerPort": 8080 + index, "name": "http"}]
                  })).collect::<Vec<_>>()},
         "status": {"phase": "Running", "podIP": "10.244.1.7", "hostIP": "10.244.0.1",
                    "qosClass": "Burstable",
