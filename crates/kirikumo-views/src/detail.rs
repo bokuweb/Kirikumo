@@ -793,6 +793,7 @@ impl Detail {
             Action::Restart => Write::Patch(actions::restart(Utc::now())),
             Action::Cordon => Write::Patch(actions::schedulable(true)),
             Action::Uncordon => Write::Patch(actions::schedulable(false)),
+            Action::Drain => Write::Drain,
             Action::Apply => {
                 let text = self.editor.read(cx).value().to_string();
                 match actions::apply(&text) {
@@ -891,6 +892,13 @@ impl Detail {
         }
         let write = self.store.read(cx).write(&key).cloned();
         let working = write.as_ref().is_some_and(|write| write.is_loading());
+        // What a landed write had to say: nothing for most, a drain's
+        // `3 evicted · 1 skipped` for a drain.
+        let landed = write
+            .as_ref()
+            .and_then(|write| write.value())
+            .filter(|line| !line.is_empty())
+            .cloned();
         let refused = self.apply_error.clone().or_else(|| {
             write
                 .as_ref()
@@ -912,6 +920,7 @@ impl Detail {
                             Action::Restart => "act-restart",
                             Action::Cordon => "act-cordon",
                             Action::Uncordon => "act-uncordon",
+                            Action::Drain => "act-drain",
                             Action::Apply => "act-apply",
                             Action::Delete => "act-delete",
                         },
@@ -992,6 +1001,14 @@ impl Detail {
                         .text_size(px(11.5))
                         .text_color(tokens.colors().status_error)
                         .child(error)
+                }))
+                .children(landed.map(|line| {
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .text_size(px(11.5))
+                        .text_color(tokens.colors().text_secondary)
+                        .child(line)
                 }))
                 .into_any_element(),
         )

@@ -22,6 +22,7 @@
 pub mod actions;
 pub mod auth;
 pub mod discovery;
+pub mod drain;
 pub mod error;
 pub mod health;
 pub mod kubeconfig;
@@ -125,6 +126,15 @@ pub trait Cluster: Send + Sync {
         _name: &str,
         _patch: Patch,
     ) -> Result<Object> {
+        Err(Error::Unsupported)
+    }
+
+    /// Ask a pod to leave, through the Eviction API.
+    ///
+    /// Unlike a delete this honours a `PodDisruptionBudget`: when the budget
+    /// says no the apiserver answers `429`, which arrives as
+    /// [`Error::Api`] with that status, and [`drain`] waits and asks again.
+    fn evict(&self, _namespace: &str, _name: &str) -> Result<()> {
         Err(Error::Unsupported)
     }
 

@@ -52,6 +52,9 @@ pub struct Scripted {
     /// How long the scripted watch waits between events. Real seconds in a
     /// demo, zero in a test.
     watch_delay: Wait,
+    /// Pods a disruption budget will not let go, as `namespace/name`. An
+    /// eviction of one answers the apiserver's `429`, every time.
+    protected: Vec<String>,
 }
 
 impl Scripted {
@@ -71,12 +74,20 @@ impl Scripted {
             pod_metrics: Vec::new(),
             logs: String::new(),
             watch_delay: Wait::ZERO,
+            protected: Vec::new(),
         }
     }
 
     /// How long the scripted watch waits between events.
     pub fn with_watch_delay(mut self, delay: Wait) -> Self {
         self.watch_delay = delay;
+        self
+    }
+
+    /// A pod a disruption budget will not let go: evicting it always gets
+    /// the apiserver's `429`. For testing a drain that has to wait.
+    pub fn with_protected_pod(mut self, namespace: &str, name: &str) -> Self {
+        self.protected.push(format!("{namespace}/{name}"));
         self
     }
 
@@ -402,6 +413,7 @@ impl Scripted {
             // Slow enough to watch happen, quick enough to see within a
             // minute of opening the window.
             watch_delay: Wait::from_secs(3),
+            protected: Vec::new(),
         }
     }
 
@@ -490,6 +502,22 @@ impl Cluster for Scripted {
         let index = Self::position(held, resource, namespace, name)?;
         held.remove(index);
         Ok(())
+    }
+
+    fn evict(&self, namespace: &str, name: &str) -> Result<()> {
+        if self.protected.contains(&format!("{namespace}/{name}")) {
+            return Err(Error::Api {
+                status: 429,
+                message: "Cannot evict pod as it would violate the pod's disruption budget.".into(),
+                reason: "TooManyRequests".into(),
+            });
+        }
+        let pods = self
+            .catalogue
+            .get(&ResourceKey::new("", "Pod"))
+            .cloned()
+            .ok_or_else(|| Error::NotFound("pods".into()))?;
+        self.delete(&pods, Some(namespace), name)
     }
 
     /// A patch, applied the way the apiserver would apply the patches this
@@ -633,6 +661,25 @@ fn node(name: &str, ready: bool, cordoned: bool, created: &str) -> Value {
     })
 }
 
+/// The controller a sample pod's name implies, the way real names do: a
+/// `-0` is a StatefulSet's, and anything with a hash before its random tail
+/// is a ReplicaSet's. Without an owner a pod is *unmanaged*, and a drain
+/// would rightly leave it alone — which is not what a demo of a drain is for.
+fn owner_of(name: &str) -> Value {
+    let (stem, tail) = match name.rsplit_once('-') {
+        Some(parts) => parts,
+        None => return json!([]),
+    };
+    let (kind, owner) = match tail.chars().all(|c| c.is_ascii_digit()) {
+        true => ("StatefulSet", stem.to_string()),
+        false => ("ReplicaSet", stem.to_string()),
+    };
+    json!([{
+        "apiVersion": "apps/v1", "kind": kind, "name": owner,
+        "uid": format!("owner-{owner}"), "controller": true
+    }])
+}
+
 fn pod_running(
     name: &str,
     namespace: &str,
@@ -658,7 +705,8 @@ fn pod_running(
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "namespace": namespace, "uid": format!("pod-{name}"),
                      "creationTimestamp": created,
-                     "labels": {"app": name.split('-').next().unwrap_or(name)}},
+                     "labels": {"app": name.split('-').next().unwrap_or(name)},
+                     "ownerReferences": owner_of(name)},
         "spec": {"nodeName": node,
                  "containers": (0..total).map(|index| json!({
                      "name": format!("c{index}"),
@@ -684,7 +732,8 @@ fn pod_waiting(
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "namespace": namespace, "uid": format!("pod-{name}"),
                      "creationTimestamp": created,
-                     "labels": {"app": name.split('-').next().unwrap_or(name)}},
+                     "labels": {"app": name.split('-').next().unwrap_or(name)},
+                     "ownerReferences": owner_of(name)},
         "spec": {"nodeName": node,
                  "containers": [{"name": "app", "image": "ghcr.io/shop/importer:next"}]},
         "status": {"phase": "Running", "podIP": "10.244.2.9", "hostIP": "10.244.0.3",

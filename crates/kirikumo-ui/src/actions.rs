@@ -102,6 +102,7 @@ pub fn confirm_label(action: Action, name: &str, replicas: Option<u32>) -> Strin
         Action::Restart => rust_i18n::t!("action.confirm.restart", name = name).to_string(),
         Action::Cordon => rust_i18n::t!("action.confirm.cordon", name = name).to_string(),
         Action::Uncordon => rust_i18n::t!("action.confirm.uncordon", name = name).to_string(),
+        Action::Drain => rust_i18n::t!("action.confirm.drain", name = name).to_string(),
         Action::Apply => rust_i18n::t!("action.confirm.apply", name = name).to_string(),
         Action::Delete => rust_i18n::t!("action.confirm.delete", name = name).to_string(),
     }
@@ -165,6 +166,7 @@ mod tests {
             Action::Delete,
             Action::Restart,
             Action::Cordon,
+            Action::Drain,
             Action::Apply,
         ] {
             assert!(Pending::arm(action, 1).can_confirm(), "{action:?}");

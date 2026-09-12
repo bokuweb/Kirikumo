@@ -535,6 +535,21 @@ impl Cluster for Rest {
         Object::new(value)
     }
 
+    fn evict(&self, namespace: &str, name: &str) -> Result<()> {
+        let eviction = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": {"name": name, "namespace": namespace}
+        });
+        self.send(
+            Method::Post,
+            &format!("/api/v1/namespaces/{namespace}/pods/{name}/eviction"),
+            "application/json",
+            &eviction,
+        )
+        .map(|_| ())
+    }
+
     fn can_i(&self, resource: &ApiResource, namespace: Option<&str>, verb: &str) -> Result<bool> {
         let review = serde_json::json!({
             "apiVersion": "authorization.k8s.io/v1",

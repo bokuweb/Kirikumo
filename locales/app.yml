@@ -162,6 +162,9 @@ action.cordon:
 action.uncordon:
   en: Uncordon
   ja: Uncordon
+action.drain:
+  en: Drain
+  ja: Drain
 action.apply:
   en: Apply
   ja: 適用
@@ -195,6 +198,9 @@ action.confirm.cordon:
 action.confirm.uncordon:
   en: "Uncordon %{name}"
   ja: "%{name} を uncordon"
+action.confirm.drain:
+  en: "Drain %{name}"
+  ja: "%{name} を drain"
 action.confirm.apply:
   en: "Apply to %{name}"
   ja: "%{name} に適用"

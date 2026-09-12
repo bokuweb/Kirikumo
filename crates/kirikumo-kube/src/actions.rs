@@ -26,6 +26,9 @@ pub enum Action {
     Cordon,
     /// Schedule onto it again.
     Uncordon,
+    /// Cordon a node and move everything off it that can move
+    /// ([`crate::drain`]).
+    Drain,
     /// Replace the object with an edited manifest.
     Apply,
     /// Remove the object.
@@ -40,6 +43,7 @@ impl Action {
         Action::Restart,
         Action::Cordon,
         Action::Uncordon,
+        Action::Drain,
         Action::Apply,
         Action::Delete,
     ];
@@ -48,7 +52,10 @@ impl Action {
     pub fn verb(self) -> &'static str {
         match self {
             Self::Delete => "delete",
-            Self::Scale | Self::Restart | Self::Cordon | Self::Uncordon => "patch",
+            // A drain is a cordon and then evictions; the cordon is what
+            // can be asked about up front. Whether each eviction is allowed
+            // is answered by the apiserver, per pod, in the report.
+            Self::Scale | Self::Restart | Self::Cordon | Self::Uncordon | Self::Drain => "patch",
             Self::Apply => "update",
         }
     }
@@ -60,15 +67,17 @@ impl Action {
             Self::Restart => "action.restart",
             Self::Cordon => "action.cordon",
             Self::Uncordon => "action.uncordon",
+            Self::Drain => "action.drain",
             Self::Apply => "action.apply",
             Self::Delete => "action.delete",
         }
     }
 
     /// Whether the action removes something, which is drawn in the error
-    /// colour so that the one button that cannot be undone looks like it.
+    /// colour so that a button that cannot be undone looks like it. A drain
+    /// counts: it evicts every pod on the node.
     pub fn is_destructive(self) -> bool {
-        matches!(self, Self::Delete)
+        matches!(self, Self::Delete | Self::Drain)
     }
 }
 
@@ -96,6 +105,7 @@ pub fn available(resource: &ApiResource, object: &Object) -> Vec<Action> {
                 true => Action::Uncordon,
                 false => Action::Cordon,
             });
+            actions.push(Action::Drain);
         }
     }
     if resource.supports("update") {
@@ -269,11 +279,28 @@ mod tests {
     }
 
     #[test]
-    fn delete_is_always_last_and_the_only_destructive_one() {
+    fn delete_is_always_last_and_only_it_and_drain_are_destructive() {
         for action in Action::ALL {
-            assert_eq!(action.is_destructive(), *action == Action::Delete);
+            assert_eq!(
+                action.is_destructive(),
+                matches!(action, Action::Delete | Action::Drain),
+                "{action:?}"
+            );
         }
         assert_eq!(Action::ALL.last(), Some(&Action::Delete));
+    }
+
+    #[test]
+    fn a_node_can_be_drained_whichever_way_it_is_cordoned() {
+        let node = resource("Node", FULL);
+        for spec in [
+            json!({"spec": {}}),
+            json!({"spec": {"unschedulable": true}}),
+        ] {
+            assert!(available(&node, &object(spec)).contains(&Action::Drain));
+        }
+        // But not a kind that is not a node.
+        assert!(!available(&resource("Pod", FULL), &object(json!({}))).contains(&Action::Drain));
     }
 
     #[test]
@@ -282,6 +309,7 @@ mod tests {
         assert_eq!(Action::Scale.verb(), "patch");
         assert_eq!(Action::Restart.verb(), "patch");
         assert_eq!(Action::Cordon.verb(), "patch");
+        assert_eq!(Action::Drain.verb(), "patch");
         assert_eq!(Action::Apply.verb(), "update");
     }
 

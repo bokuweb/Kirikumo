@@ -15,7 +15,7 @@ use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
     ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, LogRequest,
-    Metrics, Object, ObjectList, Patch, ResourceKey, WatchEvent, logs, watch,
+    Metrics, Object, ObjectList, Patch, ResourceKey, WatchEvent, drain, logs, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
@@ -40,6 +40,8 @@ pub enum Write {
     Delete,
     /// Change it.
     Patch(Patch),
+    /// Cordon the node and move everything off it that can move.
+    Drain,
 }
 
 /// Emitted whenever an answer lands.
@@ -79,8 +81,10 @@ pub struct Store {
     /// `SelfSubjectAccessReview`. Asked once per triple and kept: RBAC does
     /// not change under a window often enough to be worth asking again.
     permissions: HashMap<(ResourceKey, Option<String>, String), Fetch<bool>>,
-    /// The last write on each object: in flight, done, or refused.
-    writes: HashMap<ObjectKey, Fetch<()>>,
+    /// The last write on each object: in flight, done, or refused. A write
+    /// that landed carries a line to show — empty for most, and a drain's
+    /// report for a drain.
+    writes: HashMap<ObjectKey, Fetch<String>>,
     /// The list the window is looking at, and so the only one worth
     /// following. A cluster with ten thousand pods must not be streamed
     /// because the sidebar mentions pods (roadmap §4.7).
@@ -729,7 +733,7 @@ impl Store {
     }
 
     /// The last write on an object, if there has been one.
-    pub fn write(&self, object: &ObjectKey) -> Option<&Fetch<()>> {
+    pub fn write(&self, object: &ObjectKey) -> Option<&Fetch<String>> {
         self.writes.get(object)
     }
 
@@ -747,13 +751,26 @@ impl Store {
         };
         self.writes.entry(object.clone()).or_default().begin();
         let scope = namespace;
+        // A drain also needs to know where pods live, which only the
+        // catalogue can say.
+        let pods = self.resource(&drain::pods_key()).cloned();
+        let drained = matches!(write, Write::Drain);
         self.fetch(
             cx,
             move |cluster| match write {
-                Write::Delete => cluster.delete(&resource, scope.as_deref(), &name),
+                Write::Delete => cluster
+                    .delete(&resource, scope.as_deref(), &name)
+                    .map(|()| String::new()),
                 Write::Patch(patch) => cluster
                     .patch(&resource, scope.as_deref(), &name, patch)
-                    .map(|_| ()),
+                    .map(|_| String::new()),
+                Write::Drain => {
+                    let pods = pods.ok_or(kirikumo_kube::Error::Unsupported)?;
+                    // Slow on purpose when a budget resists; this is the
+                    // background executor, and the footer says *Working…*.
+                    drain::drain(cluster, &resource, &pods, &name, std::thread::sleep)
+                        .map(|report| report.summary())
+                }
             },
             move |this, result, cx| {
                 let landed = result.is_ok();
@@ -761,11 +778,14 @@ impl Store {
                 if landed {
                     // Every list of the kind, not just the one scoped like
                     // the object: the table may be showing all namespaces
-                    // while the object was opened in one of them.
+                    // while the object was opened in one of them. A drain
+                    // moved pods as well as touching the node, so their
+                    // lists are asked for too.
+                    let pods = drain::pods_key();
                     let held: Vec<ListKey> = this
                         .lists
                         .keys()
-                        .filter(|(kind, _)| *kind == key)
+                        .filter(|(kind, _)| *kind == key || (drained && *kind == pods))
                         .cloned()
                         .collect();
                     for (kind, scope) in held {
