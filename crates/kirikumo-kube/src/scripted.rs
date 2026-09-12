@@ -18,6 +18,7 @@
 
 use crate::actions::merge_patch;
 use crate::error::{Error, Result};
+use crate::exec::{ExecOutput, ExecRequest};
 use crate::logs::LogStream;
 use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
@@ -503,6 +504,32 @@ impl Cluster for Scripted {
         let index = Self::position(held, resource, namespace, name)?;
         held.remove(index);
         Ok(())
+    }
+
+    /// A command on the demo cluster echoes itself back, and one with `fail`
+    /// in it fails, so both shapes of the Run tab can be seen.
+    fn exec(&self, request: &ExecRequest) -> Result<ExecOutput> {
+        let pods = self
+            .catalogue
+            .get(&ResourceKey::new("", "Pod"))
+            .cloned()
+            .ok_or_else(|| Error::NotFound("pods".into()))?;
+        self.get(&pods, Some(&request.namespace), &request.pod)?;
+        let line = request.command.join(" ");
+        Ok(match line.contains("fail") {
+            true => ExecOutput {
+                stdout: String::new(),
+                stderr: format!("sh: {line}: not found\n"),
+                exit_code: Some(127),
+                failure: None,
+            },
+            false => ExecOutput {
+                stdout: format!("$ {line}\n(scripted: there is no container here)\n"),
+                stderr: String::new(),
+                exit_code: Some(0),
+                failure: None,
+            },
+        })
     }
 
     /// A forwarded port on the demo cluster is an echo on `localhost`:

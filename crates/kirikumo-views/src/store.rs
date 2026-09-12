@@ -14,8 +14,9 @@
 use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
-    ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, Forwarder,
-    LogRequest, Metrics, Object, ObjectList, Patch, ResourceKey, WatchEvent, drain, logs, watch,
+    ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, ExecOutput,
+    ExecRequest, Forwarder, LogRequest, Metrics, Object, ObjectList, Patch, ResourceKey,
+    WatchEvent, drain, exec, logs, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
@@ -85,6 +86,11 @@ pub struct Store {
     /// that landed carries a line to show — empty for most, and a drain's
     /// report for a drain.
     writes: HashMap<ObjectKey, Fetch<String>>,
+    /// The last command run in each pod: in flight, its output, or refused.
+    runs: HashMap<ObjectKey, Fetch<ExecOutput>>,
+    /// Whether this login may exec into pods, per namespace: the
+    /// `pods/exec` subresource, which the catalogue does not list.
+    exec_permissions: HashMap<Option<String>, Fetch<bool>>,
     /// Every local port being forwarded to a pod. Dropped with the store, or
     /// on a change of context: a forward is a hole into one cluster.
     forwards: Vec<ActiveForward>,
@@ -163,6 +169,8 @@ impl Store {
             pod_metrics: HashMap::new(),
             permissions: HashMap::new(),
             writes: HashMap::new(),
+            runs: HashMap::new(),
+            exec_permissions: HashMap::new(),
             forwards: Vec::new(),
             followed: None,
             watch: None,
@@ -233,6 +241,8 @@ impl Store {
         self.pod_metrics.clear();
         self.permissions.clear();
         self.writes.clear();
+        self.runs.clear();
+        self.exec_permissions.clear();
         // Dropping a forwarder stops it: nothing from the last cluster may
         // stay reachable on `localhost` under the new one's name.
         self.forwards.clear();
@@ -816,6 +826,69 @@ impl Store {
                         this.load_list(kind, scope.as_deref(), cx);
                     }
                 }
+            },
+        );
+    }
+
+    /// The last command run in a pod, if one has been.
+    pub fn run(&self, pod: &ObjectKey) -> Option<&Fetch<ExecOutput>> {
+        self.runs.get(pod)
+    }
+
+    /// Run a command in a pod and keep what it said.
+    ///
+    /// Only one at a time per pod: a second run replaces the first's output
+    /// when it lands, and the panel says *Working…* meanwhile.
+    pub fn exec(&mut self, pod: ObjectKey, request: ExecRequest, cx: &mut Context<Self>) {
+        self.runs.entry(pod.clone()).or_default().begin();
+        self.fetch(
+            cx,
+            move |cluster| cluster.exec(&request),
+            move |this, result, _| {
+                this.runs.entry(pod).or_default().finish(result);
+            },
+        );
+    }
+
+    /// Whether this login may exec into pods in a namespace, if the cluster
+    /// has said.
+    pub fn exec_permission(&self, namespace: Option<&str>) -> Option<bool> {
+        self.exec_permissions
+            .get(&namespace.map(str::to_string))
+            .and_then(|fetch| fetch.value())
+            .copied()
+    }
+
+    /// Ask whether this login may exec into pods in a namespace, once.
+    pub fn ensure_exec_permission(&mut self, namespace: Option<String>, cx: &mut Context<Self>) {
+        if self
+            .exec_permissions
+            .get(&namespace)
+            .is_some_and(|fetch| !fetch.is_idle())
+        {
+            return;
+        }
+        let Some(pods) = self.resource(&drain::pods_key()).cloned() else {
+            return;
+        };
+        let review = exec::review_resource(&pods);
+        self.exec_permissions
+            .entry(namespace.clone())
+            .or_default()
+            .begin();
+        let scope = namespace.clone();
+        self.fetch(
+            cx,
+            move |cluster| cluster.can_i(&review, scope.as_deref(), "create"),
+            move |this, result, _| {
+                let answer = result.or_else(|error| {
+                    tracing::debug!(%error, "could not ask about exec; assuming yes");
+                    Ok::<bool, String>(true)
+                });
+                this.exec_permissions
+                    .entry(namespace)
+                    .or_default()
+                    .finish(answer);
             },
         );
     }

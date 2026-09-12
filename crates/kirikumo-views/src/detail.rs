@@ -16,7 +16,7 @@ use gpui::*;
 use gpui_component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, StyledExt as _, h_flex, v_flex};
-use kirikumo_kube::{Action, LogRequest, Object, actions, yaml};
+use kirikumo_kube::{Action, ExecRequest, LogRequest, Object, actions, yaml};
 use kirikumo_ui::actions::{Pending, confirm_label};
 use kirikumo_ui::assets::icon;
 use kirikumo_ui::detail::Target;
@@ -37,6 +37,8 @@ pub enum Tab {
     Yaml,
     /// A container's output.
     Logs,
+    /// A command, run in a container.
+    Run,
 }
 
 impl Tab {
@@ -47,6 +49,7 @@ impl Tab {
             Self::Events => "detail.events",
             Self::Yaml => "detail.yaml",
             Self::Logs => "detail.logs",
+            Self::Run => "detail.run",
         }
     }
 }
@@ -94,6 +97,8 @@ pub struct Detail {
     apply_error: Option<String>,
     /// Why the last forward could not be started, if it could not.
     forward_error: Option<String>,
+    /// The command field on the Run tab.
+    command: Entity<InputState>,
 }
 
 impl Detail {
@@ -124,6 +129,16 @@ impl Detail {
         })
         .detach();
         let editor = cx.new(|cx| EditorState::new(window, cx).language("yaml"));
+        let command = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("detail.run_placeholder").to_string())
+        });
+        cx.subscribe(&command, |this, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.run_command(cx);
+            }
+        })
+        .detach();
         // Asked again on every change, not just when a tab is opened: an
         // object reached by a link is drawn before the list it lives in has
         // landed, so the moment it does the tab has to ask for its events.
@@ -152,6 +167,7 @@ impl Detail {
             editor_holds: None,
             apply_error: None,
             forward_error: None,
+            command,
         }
     }
 
@@ -222,6 +238,7 @@ impl Detail {
             "events" => Tab::Events,
             "yaml" => Tab::Yaml,
             "logs" => Tab::Logs,
+            "run" => Tab::Run,
             _ => Tab::Overview,
         };
         self.set_tab(tab, cx);
@@ -296,6 +313,11 @@ impl Detail {
                             .update(cx, |store, cx| store.show_log(request, following, cx));
                     }
                 }
+            }
+            Tab::Run => {
+                let namespace = object.meta.namespace.clone();
+                self.store
+                    .update(cx, |store, cx| store.ensure_exec_permission(namespace, cx));
             }
             Tab::Overview | Tab::Yaml => {}
         }
@@ -408,7 +430,7 @@ impl Detail {
         let tokens = Tokens::global(cx).clone();
         let has_containers = !self.containers(cx).is_empty();
         let tabs: Vec<Tab> = match has_containers {
-            true => vec![Tab::Overview, Tab::Events, Tab::Yaml, Tab::Logs],
+            true => vec![Tab::Overview, Tab::Events, Tab::Yaml, Tab::Logs, Tab::Run],
             false => vec![Tab::Overview, Tab::Events, Tab::Yaml],
         };
         h_flex()
@@ -1154,6 +1176,208 @@ impl Detail {
         )
     }
 
+    /// Run what is in the command field, in the chosen container.
+    ///
+    /// The command is the reader's own words, typed, which is the deliberate
+    /// act; the run itself is one press. It is not a K6 write to the cluster
+    /// — nothing in the apiserver changes — but it can change a container,
+    /// so the review for `pods/exec` gates it like any write.
+    fn run_command(&mut self, cx: &mut Context<Self>) {
+        let line = self.command.read(cx).value().trim().to_string();
+        if line.is_empty() {
+            return;
+        }
+        let Some(key) = self.key.clone() else {
+            return;
+        };
+        let Some(object) = self.object(cx) else {
+            return;
+        };
+        let Some(namespace) = object.meta.namespace.clone() else {
+            return;
+        };
+        if self.store.read(cx).exec_permission(Some(&namespace)) != Some(true) {
+            return;
+        }
+        let containers = self.containers(cx);
+        let mut request = ExecRequest::shell(namespace, object.meta.name.clone(), &line);
+        if let Some(container) = self
+            .container
+            .clone()
+            .or_else(|| containers.first().cloned())
+        {
+            request = request.container(container);
+        }
+        self.store
+            .update(cx, |store, cx| store.exec(key, request, cx));
+        cx.notify();
+    }
+
+    /// The Run tab: a command, and what it said.
+    fn run_tab(&mut self, object: &Object, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Tokens::global(cx).clone();
+        let containers = self.containers(cx);
+        let current = self
+            .container
+            .clone()
+            .or_else(|| containers.first().cloned())
+            .unwrap_or_default();
+        let allowed = self
+            .store
+            .read(cx)
+            .exec_permission(object.meta.namespace.as_deref())
+            == Some(true);
+        let run = self
+            .key
+            .as_ref()
+            .and_then(|key| self.store.read(cx).run(key).cloned());
+        let working = run.as_ref().is_some_and(|run| run.is_loading());
+        let refused = run.as_ref().and_then(|run| run.error()).map(str::to_string);
+        let output = run.as_ref().and_then(|run| run.value()).cloned();
+
+        let toolbar = h_flex()
+            .w_full()
+            .px_3()
+            .py_1p5()
+            .gap_1()
+            .flex_shrink_0()
+            .items_center()
+            .children(containers.into_iter().enumerate().map(|(index, name)| {
+                let selected = name == current;
+                let picked = name.clone();
+                div()
+                    .id(("run-container", index))
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(tokens.radius.control()))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .font_family("monospace")
+                    .when(selected, |this| {
+                        this.bg(tokens.colors().row_active())
+                            .text_color(tokens.colors().text_primary)
+                    })
+                    .when(!selected, |this| {
+                        this.text_color(tokens.colors().text_muted)
+                    })
+                    .hover(|this| this.bg(tokens.colors().row_hover()))
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.container = Some(picked.clone());
+                        cx.notify();
+                    }))
+            }))
+            .child(div().flex_1().child(Input::new(&self.command)))
+            .child(self.button(
+                "run",
+                rust_i18n::t!("detail.run_button").to_string(),
+                allowed && !working,
+                false,
+                cx,
+                |this, _, cx| this.run_command(cx),
+            ));
+
+        // stdout, then stderr, then the status: the two streams are separate
+        // channels on the wire and the apiserver does not order them against
+        // each other, so they are not interleaved here either.
+        let mut lines: Vec<(SharedString, bool)> = Vec::new();
+        if let Some(output) = &output {
+            lines.extend(
+                output
+                    .stdout
+                    .lines()
+                    .map(|line| (SharedString::from(line.to_string()), false)),
+            );
+            if !output.stderr.trim().is_empty() {
+                lines.push((
+                    SharedString::from(format!("— {} —", rust_i18n::t!("detail.run_stderr"))),
+                    true,
+                ));
+                lines.extend(
+                    output
+                        .stderr
+                        .lines()
+                        .map(|line| (SharedString::from(line.to_string()), true)),
+                );
+            }
+        }
+        let status: Option<(String, bool)> = output.as_ref().map(|output| match &output.failure {
+            Some(failure) => (failure.clone(), true),
+            None => match output.exit_code {
+                Some(code) => (
+                    rust_i18n::t!("detail.run_exit", code = code).to_string(),
+                    code != 0,
+                ),
+                None => (rust_i18n::t!("detail.run_no_exit").to_string(), true),
+            },
+        });
+
+        let body: AnyElement = if working {
+            crate::skeleton::detail(cx)
+        } else if let Some(error) = refused {
+            self.notice(error, true, cx)
+        } else if lines.is_empty() && output.is_some() {
+            self.notice(rust_i18n::t!("detail.run_empty").to_string(), false, cx)
+        } else if lines.is_empty() {
+            div().into_any_element()
+        } else {
+            let colors = *tokens.colors();
+            uniform_list("run-output", lines.len(), move |range, _window, _cx| {
+                range
+                    .map(|index| {
+                        let (line, is_err) = lines
+                            .get(index)
+                            .cloned()
+                            .unwrap_or((SharedString::default(), false));
+                        div()
+                            .w_full()
+                            .h(LINE_HEIGHT)
+                            .px_3()
+                            .text_size(px(12.))
+                            .font_family("monospace")
+                            .text_color(match is_err {
+                                true => colors.status_error,
+                                false => colors.text_secondary,
+                            })
+                            .child(line)
+                    })
+                    .collect()
+            })
+            .size_full()
+            .into_any_element()
+        };
+
+        v_flex()
+            .size_full()
+            .bg(tokens.colors().bg_terminal)
+            .child(toolbar)
+            .when(!allowed, |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(px(11.))
+                        .text_color(tokens.colors().text_muted)
+                        .child(rust_i18n::t!("action.forbidden").to_string()),
+                )
+            })
+            .child(div().flex_1().min_h_0().w_full().child(body))
+            .children(status.map(|(text, bad)| {
+                div()
+                    .px_3()
+                    .py_1p5()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .font_family("monospace")
+                    .text_color(match bad {
+                        true => tokens.colors().status_error,
+                        false => tokens.colors().text_muted,
+                    })
+                    .child(text)
+            }))
+            .into_any_element()
+    }
+
     /// The Logs tab: what to read, and then the reading of it.
     fn logs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
@@ -1367,6 +1591,7 @@ impl Render for Detail {
             Tab::Events => self.events(&object, cx),
             Tab::Yaml => self.yaml(&object, window, cx),
             Tab::Logs => self.logs(cx),
+            Tab::Run => self.run_tab(&object, cx),
         };
         let footer = self.footer(&object, cx);
         v_flex()

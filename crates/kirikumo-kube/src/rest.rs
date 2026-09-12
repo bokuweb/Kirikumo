@@ -14,6 +14,7 @@
 use crate::auth::Authenticator;
 use crate::discovery::{self, ResourceListWire};
 use crate::error::{Error, Result};
+use crate::exec::{self, ExecOutput, ExecRequest};
 use crate::kubeconfig::ClusterAccess;
 use crate::logs::{Lines, LogStream};
 use crate::model::{
@@ -58,6 +59,13 @@ const BODY_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// Where the metrics API lives, when it is installed at all.
 const METRICS_PREFIX: &str = "/apis/metrics.k8s.io/v1beta1";
+
+/// How long a command run in a container may take.
+///
+/// Non-interactive exec collects the whole output before showing any of it,
+/// so a command that never ends would be a panel that never fills. A minute
+/// is longer than anything a person runs to *look* at something.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The verbs that carry a body.
 #[derive(Debug, Clone, Copy)]
@@ -376,6 +384,84 @@ fn certificates(pem: &[u8]) -> Result<Vec<Certificate<'static>>> {
     Ok(certificates)
 }
 
+impl Rest {
+    /// Open a WebSocket to the apiserver, speaking the channel protocol.
+    ///
+    /// The same three facts the kubeconfig states — roots, client
+    /// certificate, verification — become a `rustls` configuration of our
+    /// own (`crate::tls`), because an upgrade is not a request `ureq` can
+    /// make. The socket is given a short read timeout once the handshake is
+    /// done, so a caller can poll it rather than block on it.
+    fn websocket(&self, path: &str, what: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
+        let credential = self.auth.credential()?;
+        let tls = crate::tls::client_config(&self.access, credential.client_cert.as_ref())?;
+
+        // `https://host:port` becomes `wss://host:port/...`. The apiserver
+        // speaks WebSocket on the same listener as everything else.
+        let (host, tcp_port) = host_and_port(&self.base)?;
+        let url = format!(
+            "{}{path}",
+            self.base
+                .replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1)
+        );
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| Error::Transport(format!("{what}: {error}")))?;
+        let headers = request.headers_mut();
+        headers.insert(
+            "Sec-WebSocket-Protocol",
+            portforward::PROTOCOL
+                .parse()
+                .map_err(|_| Error::Transport("a protocol header".into()))?,
+        );
+        if let Some(header) = credential.header {
+            headers.insert(
+                "Authorization",
+                header
+                    .parse()
+                    .map_err(|_| Error::Credentials("the credential is not a header".into()))?,
+            );
+        }
+
+        let socket = TcpStream::connect((host.as_str(), tcp_port))
+            .map_err(|error| Error::Transport(format!("{what}: {error}")))?;
+        let (ws, _response) = tungstenite::client_tls_with_config(
+            request,
+            socket,
+            None,
+            Some(Connector::Rustls(tls)),
+        )
+        .map_err(|error| match error {
+            // The apiserver answered the upgrade with a status rather than
+            // a switch: a 403 for a login that may not, a 404 for a pod that
+            // is not there. Its `Status` body says which.
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
+                Error::from_status(
+                    response.status().as_u16(),
+                    &response
+                        .body()
+                        .as_ref()
+                        .map(|body| String::from_utf8_lossy(body).into_owned())
+                        .unwrap_or_default(),
+                )
+            }
+            other => Error::Transport(format!("{what}: {other}")),
+        })?;
+
+        match ws.get_ref() {
+            MaybeTlsStream::Rustls(stream) => {
+                stream.sock.set_read_timeout(Some(portforward::POLL))?;
+            }
+            MaybeTlsStream::Plain(stream) => {
+                stream.set_read_timeout(Some(portforward::POLL))?;
+            }
+            _ => {}
+        }
+        Ok(ws)
+    }
+}
+
 impl Cluster for Rest {
     fn version(&self) -> Result<ClusterVersion> {
         let value = self.get_json("/version")?;
@@ -546,78 +632,66 @@ impl Cluster for Rest {
     }
 
     fn port_forward(&self, namespace: &str, pod: &str, port: u16) -> Result<Box<dyn Tunnel>> {
-        let credential = self.auth.credential()?;
-        let tls = crate::tls::client_config(&self.access, credential.client_cert.as_ref())?;
-
-        // `https://host:port` becomes `wss://host:port/...`. The apiserver
-        // speaks WebSocket on the same listener as everything else.
-        let (host, tcp_port) = host_and_port(&self.base)?;
-        let url = format!(
-            "{}/api/v1/namespaces/{namespace}/pods/{pod}/portforward?ports={port}",
-            self.base
-                .replacen("https://", "wss://", 1)
-                .replacen("http://", "ws://", 1)
-        );
-        let mut request = url
-            .into_client_request()
-            .map_err(|error| Error::Transport(format!("port-forward: {error}")))?;
-        let headers = request.headers_mut();
-        headers.insert(
-            "Sec-WebSocket-Protocol",
-            portforward::PROTOCOL
-                .parse()
-                .map_err(|_| Error::Transport("a protocol header".into()))?,
-        );
-        if let Some(header) = credential.header {
-            headers.insert(
-                "Authorization",
-                header
-                    .parse()
-                    .map_err(|_| Error::Credentials("the credential is not a header".into()))?,
-            );
-        }
-
-        let socket = TcpStream::connect((host.as_str(), tcp_port))
-            .map_err(|error| Error::Transport(format!("port-forward: {error}")))?;
-        let (ws, _response) = tungstenite::client_tls_with_config(
-            request,
-            socket,
-            None,
-            Some(Connector::Rustls(tls)),
-        )
-        .map_err(|error| match error {
-            // The apiserver answered the upgrade with a status rather than
-            // a switch: a 403 for a login that may not forward, a 404 for a
-            // pod that is not there. Its `Status` body says which.
-            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
-                Error::from_status(
-                    response.status().as_u16(),
-                    &response
-                        .body()
-                        .as_ref()
-                        .map(|body| String::from_utf8_lossy(body).into_owned())
-                        .unwrap_or_default(),
-                )
-            }
-            other => Error::Transport(format!("port-forward: {other}")),
-        })?;
-
-        // The pump takes turns between the pod and the local side on one
-        // thread, so a read that would block for ever has to give up after
-        // a short while instead.
-        match ws.get_ref() {
-            MaybeTlsStream::Rustls(stream) => {
-                stream.sock.set_read_timeout(Some(portforward::POLL))?;
-            }
-            MaybeTlsStream::Plain(stream) => {
-                stream.set_read_timeout(Some(portforward::POLL))?;
-            }
-            _ => {}
-        }
+        let ws = self.websocket(
+            &format!("/api/v1/namespaces/{namespace}/pods/{pod}/portforward?ports={port}"),
+            "port-forward",
+        )?;
         Ok(Box::new(WsTunnel {
             ws,
             opened: [false; 2],
         }))
+    }
+
+    fn exec(&self, request: &ExecRequest) -> Result<ExecOutput> {
+        let mut ws = self.websocket(
+            &format!(
+                "/api/v1/namespaces/{}/pods/{}/exec?{}",
+                request.namespace,
+                request.pod,
+                request.query()
+            ),
+            "exec",
+        )?;
+        // Collected, not attached to: read until the status frame or the
+        // close, whichever the apiserver sends first. A read timeout is set
+        // by `websocket`, so a silent command is polled rather than waited
+        // on for ever; the deadline is what ends a command that never
+        // finishes.
+        let deadline = std::time::Instant::now() + EXEC_TIMEOUT;
+        let mut output = ExecOutput::default();
+        loop {
+            if std::time::Instant::now() > deadline {
+                output.failure = Some(format!(
+                    "still running after {} seconds; the output so far is above",
+                    EXEC_TIMEOUT.as_secs()
+                ));
+                let _ = ws.close(None);
+                break;
+            }
+            match ws.read() {
+                Ok(Message::Binary(bytes)) => {
+                    if let Some((channel, payload)) = portforward::parse_frame(&bytes)
+                        && exec::take_frame(&mut output, channel, payload)
+                    {
+                        let _ = ws.close(None);
+                        let _ = ws.flush();
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                    break;
+                }
+                Err(error) => return Err(exec::could_not_run(error)),
+            }
+        }
+        Ok(output)
     }
 
     fn evict(&self, namespace: &str, name: &str) -> Result<()> {
@@ -636,12 +710,19 @@ impl Cluster for Rest {
     }
 
     fn can_i(&self, resource: &ApiResource, namespace: Option<&str>, verb: &str) -> Result<bool> {
+        // `pods/exec` is a resource and a subresource to the review, not one
+        // name with a slash in it.
+        let (name, subresource) = match resource.name.split_once('/') {
+            Some((name, subresource)) => (name, subresource),
+            None => (resource.name.as_str(), ""),
+        };
         let review = serde_json::json!({
             "apiVersion": "authorization.k8s.io/v1",
             "kind": "SelfSubjectAccessReview",
             "spec": {"resourceAttributes": {
                 "group": resource.group,
-                "resource": resource.name,
+                "resource": name,
+                "subresource": subresource,
                 "verb": verb,
                 "namespace": namespace.unwrap_or_default(),
             }}

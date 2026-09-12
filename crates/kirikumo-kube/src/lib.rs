@@ -7,8 +7,9 @@
 //! ([`health`]), quantity parsing ([`quantity`]), the [`Cluster`] trait every
 //! view reaches a cluster through, its REST implementation ([`rest`]), the
 //! framing of a watch ([`watch`]), the few writes and what each becomes on
-//! the wire ([`actions`], [`drain`]), a port forwarded to a pod
-//! ([`portforward`], over [`tls`]), and a scripted fake ([`scripted`]).
+//! the wire ([`actions`], [`drain`]), a port forwarded to a pod and a command
+//! run in one ([`portforward`], [`exec`], over [`tls`]), and a scripted fake
+//! ([`scripted`]).
 //!
 //! What does not live here: anything that knows a colour, a column or a
 //! window. This crate has no `gpui` dependency and never will
@@ -25,6 +26,7 @@ pub mod auth;
 pub mod discovery;
 pub mod drain;
 pub mod error;
+pub mod exec;
 pub mod health;
 pub mod kubeconfig;
 pub mod logs;
@@ -39,6 +41,7 @@ pub mod yaml;
 
 pub use actions::Action;
 pub use error::{Error, Result};
+pub use exec::{ExecOutput, ExecRequest};
 pub use health::{Health, Level};
 pub use kubeconfig::{KubeConfig, kubeconfig_paths};
 pub use logs::LogStream;
@@ -139,6 +142,15 @@ pub trait Cluster: Send + Sync {
     /// that connection's thread; see [`portforward`] for why it is one
     /// tunnel per connection.
     fn port_forward(&self, _namespace: &str, _pod: &str, _port: u16) -> Result<Box<dyn Tunnel>> {
+        Err(Error::Unsupported)
+    }
+
+    /// Run a command in a container and collect what it wrote.
+    ///
+    /// Non-interactive: no stdin, no tty, the whole output at the end. Slow
+    /// by nature — it lasts as long as the command — so it belongs on the
+    /// background executor like every other call.
+    fn exec(&self, _request: &ExecRequest) -> Result<ExecOutput> {
         Err(Error::Unsupported)
     }
 

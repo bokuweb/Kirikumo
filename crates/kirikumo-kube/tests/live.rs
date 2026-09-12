@@ -233,6 +233,59 @@ fn a_port_forward_carries_real_http_to_a_pod() {
 
 #[test]
 #[ignore = "needs a live cluster"]
+fn a_command_runs_in_a_container_and_reports_its_exit() {
+    let cluster = connect();
+    let ok = cluster
+        .exec(&kirikumo_kube::ExecRequest::shell(
+            namespace(),
+            "talker",
+            "echo hello from $HOSTNAME; echo warn >&2",
+        ))
+        .expect("exec");
+    assert!(ok.stdout.contains("hello from talker"), "{ok:?}");
+    assert!(ok.stderr.contains("warn"), "{ok:?}");
+    assert_eq!(ok.exit_code, Some(0), "{ok:?}");
+    assert!(ok.succeeded());
+
+    let failed = cluster
+        .exec(&kirikumo_kube::ExecRequest::shell(
+            namespace(),
+            "talker",
+            "exit 3",
+        ))
+        .expect("exec");
+    assert_eq!(failed.exit_code, Some(3), "{failed:?}");
+    assert!(!failed.succeeded());
+
+    // A container that is not there is the apiserver's refusal, not a hang.
+    let missing = cluster
+        .exec(&kirikumo_kube::ExecRequest::shell(namespace(), "talker", "true").container("nope"));
+    match missing {
+        Ok(output) => assert!(output.failure.is_some(), "{output:?}"),
+        Err(error) => assert!(
+            matches!(
+                error,
+                kirikumo_kube::Error::Api { .. } | kirikumo_kube::Error::NotFound(_)
+            ),
+            "{error}"
+        ),
+    }
+
+    // And the review knows the subresource.
+    let pods = resource(&cluster, "", "Pod");
+    assert!(
+        cluster
+            .can_i(
+                &kirikumo_kube::exec::review_resource(&pods),
+                Some(&namespace()),
+                "create"
+            )
+            .expect("review")
+    );
+}
+
+#[test]
+#[ignore = "needs a live cluster"]
 fn a_port_forward_to_a_missing_pod_is_refused_with_a_status() {
     let cluster = connect();
     match cluster.port_forward(&namespace(), "no-such-pod", 80) {

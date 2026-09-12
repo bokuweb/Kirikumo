@@ -122,6 +122,27 @@ detail.yaml:
 detail.logs:
   en: Logs
   ja: ログ
+detail.run:
+  en: Run
+  ja: 実行
+detail.run_placeholder:
+  en: A command, run through sh -c
+  ja: コマンド（sh -c で実行）
+detail.run_button:
+  en: Run
+  ja: 実行
+detail.run_exit:
+  en: "exit %{code}"
+  ja: "終了コード %{code}"
+detail.run_no_exit:
+  en: ended without an exit code
+  ja: 終了コードなしで終了
+detail.run_stderr:
+  en: stderr
+  ja: 標準エラー
+detail.run_empty:
+  en: The command wrote nothing.
+  ja: コマンドは何も出力しませんでした。
 detail.conditions:
   en: Conditions
   ja: 状態
