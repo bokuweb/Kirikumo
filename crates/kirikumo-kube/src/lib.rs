@@ -23,11 +23,13 @@
 
 pub mod actions;
 pub mod auth;
+pub mod crd;
 pub mod discovery;
 pub mod drain;
 pub mod error;
 pub mod exec;
 pub mod health;
+pub mod jsonpath;
 pub mod kubeconfig;
 pub mod logs;
 pub mod model;
@@ -40,6 +42,7 @@ pub mod watch;
 pub mod yaml;
 
 pub use actions::Action;
+pub use crd::{PrinterColumn, PrinterColumns};
 pub use error::{Error, Result};
 pub use exec::{ExecOutput, ExecRequest};
 pub use health::{Health, Level};

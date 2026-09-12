@@ -15,8 +15,8 @@ use gpui::{AppContext as _, Context, EventEmitter};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
     ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, ExecOutput,
-    ExecRequest, Forwarder, LogRequest, Metrics, Object, ObjectList, Patch, ResourceKey,
-    WatchEvent, drain, exec, logs, watch,
+    ExecRequest, Forwarder, LogRequest, Metrics, Object, ObjectList, Patch, PrinterColumn,
+    PrinterColumns, ResourceKey, WatchEvent, crd, drain, exec, logs, watch,
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
@@ -63,6 +63,9 @@ pub struct Store {
     version: Fetch<ClusterVersion>,
     catalogue: Fetch<Catalogue>,
     namespaces: Fetch<Vec<String>>,
+    /// The columns each custom kind declares, read from the CRDs once
+    /// discovery has said the cluster has any.
+    printer_columns: Fetch<PrinterColumns>,
     lists: HashMap<ListKey, Fetch<ObjectList>>,
     events: HashMap<String, Fetch<Vec<EventRecord>>>,
     /// Each container's log, as lines — never as one string, because the
@@ -160,6 +163,7 @@ impl Store {
             version: Fetch::Idle,
             catalogue: Fetch::Idle,
             namespaces: Fetch::Idle,
+            printer_columns: Fetch::Idle,
             lists: HashMap::new(),
             events: HashMap::new(),
             logs: HashMap::new(),
@@ -233,6 +237,7 @@ impl Store {
         self.version = Fetch::Idle;
         self.catalogue = Fetch::Idle;
         self.namespaces = Fetch::Idle;
+        self.printer_columns = Fetch::Idle;
         self.lists.clear();
         self.events.clear();
         self.stop_following_log();
@@ -978,13 +983,54 @@ impl Store {
         self.fetch(
             cx,
             |cluster| cluster.catalogue(),
-            |this, result, _| this.catalogue.finish(result),
+            |this, result, cx| {
+                this.catalogue.finish(result);
+                // What the custom kinds' tables look like is in their CRDs,
+                // which can only be asked for once discovery has said the
+                // cluster serves CRDs at all.
+                this.load_printer_columns(cx);
+            },
         );
         self.namespaces.begin();
         self.fetch(
             cx,
             |cluster| cluster.namespaces(),
             |this, result, _| this.namespaces.finish(result),
+        );
+    }
+
+    /// The columns a custom kind declares, once its CRD has been read.
+    pub fn printer_columns(&self, key: &ResourceKey) -> Option<&[PrinterColumn]> {
+        self.printer_columns.value()?.get(key).map(Vec::as_slice)
+    }
+
+    /// Read every CRD, for the columns each declares.
+    ///
+    /// One list, once per connection. A cluster that serves no CRDs — or
+    /// will not let this login list them — leaves the map empty, and every
+    /// custom kind gets the plain table, which is what it would have had
+    /// anyway.
+    fn load_printer_columns(&mut self, cx: &mut Context<Self>) {
+        let crds = ResourceKey::new("apiextensions.k8s.io", "CustomResourceDefinition");
+        let Some(resource) = self.resource(&crds).cloned() else {
+            self.printer_columns.finish(Ok(PrinterColumns::new()));
+            return;
+        };
+        self.printer_columns.begin();
+        self.fetch(
+            cx,
+            move |cluster| {
+                cluster
+                    .list(&resource, None)
+                    .map(|list| crd::from_list(&list.items))
+            },
+            |this, result, _| {
+                let columns = result.unwrap_or_else(|error| {
+                    tracing::debug!(%error, "could not read the CRDs; custom kinds get the plain table");
+                    PrinterColumns::new()
+                });
+                this.printer_columns.finish(Ok(columns));
+            },
         );
     }
 

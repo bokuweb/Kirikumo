@@ -76,7 +76,7 @@ The centre strip carries the kind's name and the namespace it is scoped to, then
 
 A `uniform_list` of 28 px rows under a sticky header:
 
-- The **health mark** in the first 16 px, then the columns for the kind. The column set is `kubectl get`'s, per kind, and for anything with no set of its own the fallback is Name, Namespace (when namespaced), and Age — which is what `kubectl` prints for a CRD too.
+- The **health mark** in the first 16 px, then the columns for the kind. The column set is `kubectl get`'s, per kind. A custom resource gets the columns its CRD declares, between NAME and AGE, headings upper-cased the way `kubectl` prints them, numeric ones right-aligned and `date` ones as ages; a CRD that declares none — and anything else with no set of its own — gets Name, Namespace (when namespaced), and Age.
 - Names in mono; ages as the shortest unit that says it (`3d`, `2h17m`, `45s`), as `kubectl` writes them.
 - The header is clickable and sorts; the arrow says which way. The default is the kind's own: Age descending for Pods and Events, name ascending otherwise.
 - Selecting a row draws it in `row.active` and opens it on the right; the table never navigates away underneath.

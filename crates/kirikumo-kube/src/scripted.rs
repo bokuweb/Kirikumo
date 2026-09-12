@@ -116,6 +116,13 @@ impl Scripted {
                 true,
             ),
             resource("argoproj.io", "v1alpha1", "Rollout", "rollouts", true),
+            resource(
+                "apiextensions.k8s.io",
+                "v1",
+                "CustomResourceDefinition",
+                "customresourcedefinitions",
+                false,
+            ),
         ];
         let catalogue = discovery::catalogue(vec![resources]);
 
@@ -303,6 +310,27 @@ impl Scripted {
                     "status": {"phase": "Pending"}
                 }),
             ]),
+        );
+
+        // The CRD behind the custom resource below, with the columns its
+        // authors chose — so the demo's Rollouts table has them, and nobody
+        // wrote a column for a Rollout here (`AGENTS.md` rule 8).
+        objects.insert(
+            ResourceKey::new("apiextensions.k8s.io", "CustomResourceDefinition"),
+            parse(vec![json!({
+                "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                "metadata": {"name": "rollouts.argoproj.io", "uid": "crd-rollouts",
+                             "creationTimestamp": ago(60 * 24 * 30)},
+                "spec": {"group": "argoproj.io", "scope": "Namespaced",
+                         "names": {"kind": "Rollout", "plural": "rollouts", "singular": "rollout"},
+                         "versions": [{"name": "v1alpha1", "served": true, "storage": true,
+                             "additionalPrinterColumns": [
+                                 {"name": "Desired", "type": "integer", "jsonPath": ".spec.replicas"},
+                                 {"name": "Ready", "type": "integer", "jsonPath": ".status.readyReplicas"},
+                                 {"name": "Available", "type": "string",
+                                  "jsonPath": ".status.conditions[?(@.type==\"Available\")].status"}
+                             ]}]}
+            })]),
         );
 
         // A custom resource, to prove the sidebar and the table need no code
@@ -1027,6 +1055,24 @@ mod tests {
         assert!(levels.contains(&Level::Ok));
         assert!(levels.contains(&Level::Attention));
         assert!(levels.contains(&Level::Error));
+    }
+
+    #[test]
+    fn the_samples_custom_resource_comes_with_the_columns_its_crd_declares() {
+        let cluster = Scripted::sample();
+        let crds = resource_for(&cluster, "apiextensions.k8s.io", "CustomResourceDefinition");
+        let columns = crate::crd::from_list(&cluster.list(&crds, None).unwrap().items);
+        let rollout = columns
+            .get(&ResourceKey::new("argoproj.io", "Rollout"))
+            .expect("the rollout CRD declares columns");
+        assert_eq!(rollout.len(), 3);
+        let rollouts = resource_for(&cluster, "argoproj.io", "Rollout");
+        let web = cluster.get(&rollouts, Some("shop"), "web").unwrap();
+        let cells: Vec<String> = rollout
+            .iter()
+            .map(|column| crate::jsonpath::cell(&web.raw, &column.json_path))
+            .collect();
+        assert_eq!(cells, vec!["2", "1", "True"]);
     }
 
     #[test]

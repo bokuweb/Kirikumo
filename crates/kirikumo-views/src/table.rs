@@ -176,9 +176,13 @@ impl ResourceTable {
     fn recolumn(&mut self, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         let resource = self.kind.as_ref().and_then(|kind| store.resource(kind));
+        let printer = self
+            .kind
+            .as_ref()
+            .and_then(|kind| store.printer_columns(kind));
         let show_namespace = self.namespace.is_none();
         self.columns = match resource {
-            Some(resource) => ColumnSet::for_resource(resource, show_namespace),
+            Some(resource) => ColumnSet::for_resource(resource, show_namespace, printer),
             None => ColumnSet::for_kind("", true, show_namespace),
         };
         self.sort = self.columns.default_sort();
@@ -192,10 +196,20 @@ impl ResourceTable {
             cx.notify();
             return;
         };
-        // Discovery may have landed since the kind was chosen, in which case
-        // the columns were built without a resource to look at.
-        if self.columns.kind().is_empty() {
+        // Discovery — or the CRDs — may have landed since the kind was
+        // chosen, in which case the columns were built without a resource,
+        // or without the columns its CRD declares, to look at.
+        let printer_known = self
+            .store
+            .read(cx)
+            .printer_columns(&kind)
+            .is_some_and(|columns| !columns.is_empty());
+        if self.columns.kind().is_empty() || (printer_known && self.columns.is_generic()) {
             self.recolumn(cx);
+            // A new set of columns is a new set of cells: rows built for the
+            // old one must not be reused by their version, or the table would
+            // draw three cells under six headings.
+            self.rows.clear();
         }
         let now = Utc::now();
         // Taken rather than borrowed, so the rows that survive can be moved
@@ -287,7 +301,7 @@ impl ResourceTable {
                     })
                     .hover(|this| this.text_color(tokens.colors().text_primary))
                     .on_click(cx.listener(move |this, _, _, cx| this.sort_by(index, cx)))
-                    .child(div().truncate().child(column.title))
+                    .child(div().truncate().child(column.title.clone()))
                     .when(is_sorted, |this| {
                         this.child(
                             div()

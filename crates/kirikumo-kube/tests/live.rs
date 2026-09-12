@@ -10,7 +10,9 @@
 //! Ignored by default. Run with a cluster in the kubeconfig that you do not
 //! mind writing to — a `kind` cluster is the intended one — and a namespace
 //! named by `KIRIKUMO_LIVE_NAMESPACE` (default `shop`) holding a Deployment
-//! called `web` on port 80 and a pod called `talker` that logs:
+//! called `web` on port 80, a pod called `talker` that logs, and a CRD
+//! `widgets.example.kirikumo.dev` with printer columns and a `red-one`
+//! widget in `Spinning` phase with a `Ready` condition:
 //!
 //! ```bash
 //! cargo test -p kirikumo-kube --test live -- --ignored --test-threads=1
@@ -281,6 +283,41 @@ fn a_command_runs_in_a_container_and_reports_its_exit() {
                 "create"
             )
             .expect("review")
+    );
+}
+
+#[test]
+#[ignore = "needs a live cluster"]
+fn a_crds_printer_columns_evaluate_to_what_kubectl_prints() {
+    // Needs the `widgets.example.kirikumo.dev` CRD and the `red-one` widget
+    // the suite's setup applies (see the module doc).
+    let cluster = connect();
+    let crds = resource(&cluster, "apiextensions.k8s.io", "CustomResourceDefinition");
+    let columns = kirikumo_kube::crd::from_list(&cluster.list(&crds, None).expect("crds").items);
+    let widget = ResourceKey::new("example.kirikumo.dev", "Widget");
+    let declared = columns
+        .get(&widget)
+        .expect("the widget CRD declares columns");
+    let names: Vec<&str> = declared.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Colour", "Replicas", "Phase", "Ready", "Started"]
+    );
+
+    let widgets = resource(&cluster, "example.kirikumo.dev", "Widget");
+    let red = cluster
+        .get(&widgets, Some(&namespace()), "red-one")
+        .expect("red-one");
+    let cells: Vec<String> = declared
+        .iter()
+        .map(|column| kirikumo_kube::jsonpath::cell(&red.raw, &column.json_path))
+        .collect();
+    // What `kubectl -n shop get widgets -o wide` printed for it.
+    assert_eq!(&cells[..4], &["red", "3", "Spinning", "True"]);
+    assert!(
+        cells[4].ends_with('Z'),
+        "a date column is the raw timestamp here: {}",
+        cells[4]
     );
 }
 

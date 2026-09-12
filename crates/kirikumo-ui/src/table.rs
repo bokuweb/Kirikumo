@@ -13,7 +13,9 @@
 //! too.
 
 use chrono::{DateTime, Utc};
-use kirikumo_kube::{ApiResource, Health, Level, Object, health, quantity};
+use kirikumo_kube::{
+    ApiResource, Health, Level, Object, PrinterColumn, health, jsonpath, quantity,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -30,8 +32,8 @@ pub enum Width {
 /// One column.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
-    /// The heading, in `kubectl`'s spelling.
-    pub title: &'static str,
+    /// The heading, in `kubectl`'s spelling — or a CRD's own.
+    pub title: String,
     /// How wide.
     pub width: Width,
     /// Whether the cells are identifiers, which are drawn in the mono family
@@ -42,36 +44,36 @@ pub struct Column {
 }
 
 impl Column {
-    const fn text(title: &'static str, flex: f32) -> Self {
+    fn text(title: &str, flex: f32) -> Self {
         Self {
-            title,
+            title: title.to_string(),
             width: Width::Flex(flex),
             mono: false,
             numeric: false,
         }
     }
 
-    const fn id(title: &'static str, flex: f32) -> Self {
+    fn id(title: &str, flex: f32) -> Self {
         Self {
-            title,
+            title: title.to_string(),
             width: Width::Flex(flex),
             mono: true,
             numeric: false,
         }
     }
 
-    const fn num(title: &'static str, pixels: f32) -> Self {
+    fn num(title: &str, pixels: f32) -> Self {
         Self {
-            title,
+            title: title.to_string(),
             width: Width::Fixed(pixels),
             mono: true,
             numeric: true,
         }
     }
 
-    const fn fixed(title: &'static str, pixels: f32) -> Self {
+    fn fixed(title: &str, pixels: f32) -> Self {
         Self {
-            title,
+            title: title.to_string(),
             width: Width::Fixed(pixels),
             mono: true,
             numeric: false,
@@ -80,8 +82,13 @@ impl Column {
 }
 
 /// What to read out of an object for one column.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Cell {
+    /// A CRD's own column: a JSONPath into the object.
+    JsonPath(String),
+    /// A CRD's own column of type `date`: a timestamp at a JSONPath, shown
+    /// as an age.
+    JsonPathDate(String),
     /// `metadata.name`.
     Name,
     /// `metadata.namespace`.
@@ -308,9 +315,48 @@ impl ColumnSet {
     }
 
     /// The columns for a resource, given whether the table is showing every
-    /// namespace.
-    pub fn for_resource(resource: &ApiResource, show_namespace: bool) -> Self {
-        Self::for_kind(&resource.kind, resource.namespaced, show_namespace)
+    /// namespace, and the columns its CRD declares if it is a custom kind.
+    ///
+    /// A kind with a set of its own here keeps it. Everything else — every
+    /// custom resource — gets the columns its own authors designed, between
+    /// NAME and AGE, exactly as `kubectl get -o wide` prints them; a CRD that
+    /// declares none gets the plain table.
+    pub fn for_resource(
+        resource: &ApiResource,
+        show_namespace: bool,
+        printer: Option<&[PrinterColumn]>,
+    ) -> Self {
+        let mut set = Self::for_kind(&resource.kind, resource.namespaced, show_namespace);
+        let Some(printer) = printer.filter(|columns| !columns.is_empty()) else {
+            return set;
+        };
+        if set.is_generic() {
+            let age = set.columns.pop();
+            for column in printer {
+                let cell = match column.is_date() {
+                    true => Cell::JsonPathDate(column.json_path.clone()),
+                    false => Cell::JsonPath(column.json_path.clone()),
+                };
+                let heading = column.name.to_uppercase();
+                let drawn = match (column.is_numeric(), column.is_date()) {
+                    (true, _) => Column::num(&heading, 82.),
+                    (_, true) => Column::fixed(&heading, 74.),
+                    _ => Column::text(&heading, 1.0),
+                };
+                set.columns.push((drawn, cell));
+            }
+            set.columns.extend(age);
+        }
+        set
+    }
+
+    /// Whether this is the fallback table — NAME, maybe NAMESPACE, AGE — with
+    /// nothing kind-specific in it, which is when a CRD's own columns are
+    /// worth more than ours.
+    pub fn is_generic(&self) -> bool {
+        self.columns
+            .iter()
+            .all(|(_, cell)| matches!(cell, Cell::Name | Cell::Namespace | Cell::Age))
     }
 
     /// The kind these columns are for.
@@ -351,7 +397,7 @@ impl ColumnSet {
     pub fn cells(&self, object: &Object, now: DateTime<Utc>) -> Vec<String> {
         self.columns
             .iter()
-            .map(|(_, cell)| render(*cell, &self.kind, object, now))
+            .map(|(_, cell)| render(cell, &self.kind, object, now))
             .collect()
     }
 
@@ -491,8 +537,17 @@ fn numeric(cell: &str) -> Option<f64> {
 }
 
 /// Read one cell out of an object.
-fn render(cell: Cell, kind: &str, object: &Object, now: DateTime<Utc>) -> String {
+fn render(cell: &Cell, kind: &str, object: &Object, now: DateTime<Utc>) -> String {
     match cell {
+        Cell::JsonPath(path) => jsonpath::cell(&object.raw, path),
+        Cell::JsonPathDate(path) => {
+            let text = jsonpath::cell(&object.raw, path);
+            match DateTime::parse_from_rfc3339(&text) {
+                Ok(time) => crate::time::age(Some(time.with_timezone(&Utc)), now),
+                Err(_) if text.is_empty() => NONE.to_string(),
+                Err(_) => text,
+            }
+        }
         Cell::Name => object.meta.name.clone(),
         Cell::Namespace => object.meta.namespace.clone().unwrap_or_default(),
         Cell::Age => crate::time::age(object.meta.created, now),
@@ -815,7 +870,10 @@ mod tests {
     fn every_kind_starts_with_a_name_and_ends_with_an_age() {
         for kind in ["Pod", "Node", "Rollout", "Event"] {
             let columns = ColumnSet::for_kind(kind, true, true);
-            let titles: Vec<&str> = columns.columns().map(|column| column.title).collect();
+            let titles: Vec<&str> = columns
+                .columns()
+                .map(|column| column.title.as_str())
+                .collect();
             assert_eq!(titles.first(), Some(&"NAME"), "{kind}");
             assert_eq!(titles.last(), Some(&"AGE"), "{kind}");
         }
@@ -824,7 +882,10 @@ mod tests {
     #[test]
     fn a_kind_nobody_wrote_columns_for_still_gets_a_table() {
         let columns = ColumnSet::for_kind("Rollout", true, true);
-        let titles: Vec<&str> = columns.columns().map(|column| column.title).collect();
+        let titles: Vec<&str> = columns
+            .columns()
+            .map(|column| column.title.as_str())
+            .collect();
         assert_eq!(titles, vec!["NAME", "NAMESPACE", "AGE"]);
     }
 
@@ -1097,6 +1158,115 @@ mod tests {
         assert_eq!(
             columns.rows(&objects, &[], now()),
             vec![columns.row(&objects[0], now())]
+        );
+    }
+
+    fn printer(name: &str, kind: &str, path: &str) -> PrinterColumn {
+        PrinterColumn {
+            name: name.into(),
+            kind: kind.into(),
+            json_path: path.into(),
+            priority: 0,
+        }
+    }
+
+    fn widgets() -> ApiResource {
+        ApiResource {
+            group: "example.kirikumo.dev".into(),
+            version: "v1".into(),
+            kind: "Widget".into(),
+            name: "widgets".into(),
+            singular: "widget".into(),
+            namespaced: true,
+            verbs: vec!["list".into()],
+            short_names: Vec::new(),
+            categories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_custom_resource_gets_the_columns_its_crd_declares_between_name_and_age() {
+        let columns = ColumnSet::for_resource(
+            &widgets(),
+            false,
+            Some(&[
+                printer("Colour", "string", ".spec.colour"),
+                printer("Replicas", "integer", ".spec.replicas"),
+                printer(
+                    "Ready",
+                    "string",
+                    ".status.conditions[?(@.type==\"Ready\")].status",
+                ),
+                printer("Started", "date", ".metadata.creationTimestamp"),
+            ]),
+        );
+        let titles: Vec<&str> = columns
+            .columns()
+            .map(|column| column.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["NAME", "COLOUR", "REPLICAS", "READY", "STARTED", "AGE"]
+        );
+        let widget = object(json!({
+            "metadata": {"name": "red-one", "namespace": "shop",
+                         "creationTimestamp": "2026-09-07T09:00:00Z"},
+            "spec": {"colour": "red", "replicas": 3},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        }));
+        assert_eq!(
+            columns.cells(&widget, now()),
+            vec!["red-one", "red", "3", "True", "3h", "3h"]
+        );
+        // A numeric printer column is drawn as a number.
+        assert!(columns.columns().nth(2).unwrap().numeric);
+    }
+
+    #[test]
+    fn a_kind_with_columns_of_its_own_keeps_them_whatever_a_crd_says() {
+        // Not that a Pod has a CRD; the rule is what matters: the hand-written
+        // set wins, so a printer column can never displace READY.
+        let columns = ColumnSet::for_resource(
+            &ApiResource {
+                kind: "Pod".into(),
+                name: "pods".into(),
+                ..widgets()
+            },
+            false,
+            Some(&[printer("X", "string", ".x")]),
+        );
+        let titles: Vec<&str> = columns
+            .columns()
+            .map(|column| column.title.as_str())
+            .collect();
+        assert!(titles.contains(&"READY"));
+        assert!(!titles.contains(&"X"));
+    }
+
+    #[test]
+    fn a_crd_with_no_columns_declared_gets_the_plain_table() {
+        let columns = ColumnSet::for_resource(&widgets(), true, Some(&[]));
+        let titles: Vec<&str> = columns
+            .columns()
+            .map(|column| column.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["NAME", "NAMESPACE", "AGE"]);
+    }
+
+    #[test]
+    fn a_printer_column_the_object_does_not_have_is_an_empty_cell() {
+        let columns = ColumnSet::for_resource(
+            &widgets(),
+            false,
+            Some(&[
+                printer("Phase", "string", ".status.phase"),
+                printer("Started", "date", ".status.startedAt"),
+            ]),
+        );
+        let bare = object(json!({"metadata": {"name": "w"}}));
+        assert_eq!(
+            columns.cells(&bare, now()),
+            vec!["w", "", "<none>", "<unknown>"]
         );
     }
 
