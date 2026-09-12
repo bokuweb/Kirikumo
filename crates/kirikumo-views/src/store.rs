@@ -940,7 +940,16 @@ impl Store {
             let result = cx
                 .background_spawn(async move {
                     work(cluster.as_ref()).map_err(|error| {
-                        tracing::warn!(%error, "a request to the cluster failed");
+                        // A kind the cluster does not serve — `metrics.k8s.io`
+                        // on a cluster with no metrics server, most often —
+                        // is an answer, not a failure worth a warning.
+                        match error {
+                            kirikumo_kube::Error::NotFound(_)
+                            | kirikumo_kube::Error::Unsupported => {
+                                tracing::debug!(%error, "the cluster does not have that")
+                            }
+                            _ => tracing::warn!(%error, "a request to the cluster failed"),
+                        }
                         describe(&error)
                     })
                 })

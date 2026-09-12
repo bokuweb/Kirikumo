@@ -442,7 +442,12 @@ impl Cluster for Rest {
         // The streaming agent, for the same reason a watch uses it: a log
         // that says nothing for an hour is a log working as designed.
         let (_, agent, header) = self.prepare()?;
-        let mut builder = agent.get(self.url(&path)).header("Accept", "text/plain");
+        // `application/json`, even though what comes back is text: the log
+        // subresource refuses any other `Accept` with a 406, and answers
+        // this one with the plain lines it always sends.
+        let mut builder = agent
+            .get(self.url(&path))
+            .header("Accept", "application/json");
         if let Some(header) = header {
             builder = builder.header("Authorization", header);
         }

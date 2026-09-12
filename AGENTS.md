@@ -35,6 +35,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo test -p kirikumo-kube -p kirikumo-ui  # the fast loop: no GPUI build
+cargo test -p kirikumo-kube --test live -- --ignored --test-threads=1   # against the kubeconfig's
+                                            # current cluster; writes to it. See tests/live.rs.
 ```
 
 On a volume without native extended attributes macOS drops `._*` sidecar files next to every file written; `rust-i18n` reads every file in `locales/`, so delete them (`find . -name '._*' -not -path './target/*' -delete`) before a build that fails on `locales/._app.yml`.
