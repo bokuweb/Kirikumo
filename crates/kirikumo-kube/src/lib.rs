@@ -2,8 +2,9 @@
 //!
 //! What lives here: reading and merging a kubeconfig ([`kubeconfig`]), turning
 //! a context into credentials that survive rotation ([`auth`]), asking an
-//! apiserver what it serves ([`discovery`]), the generic object model
-//! ([`model`]), the rule that turns an object into a health mark
+//! apiserver what it serves ([`discovery`]) and what columns its custom
+//! kinds declare ([`crd`], evaluated by [`jsonpath`]), the generic object
+//! model ([`model`]), the rule that turns an object into a health mark
 //! ([`health`]), quantity parsing ([`quantity`]), the [`Cluster`] trait every
 //! view reaches a cluster through, its REST implementation ([`rest`]), the
 //! framing of a watch ([`watch`]), the few writes and what each becomes on

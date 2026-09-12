@@ -81,6 +81,9 @@ pub struct Detail {
     /// How many lines the log had at the last frame, so that following can
     /// tell "something arrived" from "nothing did".
     last_lines: usize,
+    /// Whether the last frame scrolled the log itself, which is the one case
+    /// where "not at the end" does not mean the reader moved it.
+    scrolled_last_frame: bool,
     /// A write between its first gesture and its second.
     pending: Pending,
     /// The replica count field, for a scale.
@@ -160,6 +163,7 @@ impl Detail {
             find,
             scroll: UniformListScrollHandle::new(),
             last_lines: 0,
+            scrolled_last_frame: false,
             pending: Pending::Idle,
             replicas,
             editor,
@@ -1404,13 +1408,22 @@ impl Detail {
         let query = self.find.read(cx).value().to_string();
         let visible = logs::matching(&lines, &query);
 
-        // Following means the end stays in view. Only when something actually
-        // arrived: scrolling on every frame would fight the reader the moment
-        // they touched the wheel.
-        if self.following && lines.len() != self.last_lines && !visible.is_empty() {
-            self.scroll
-                .scroll_to_item(visible.len() - 1, ScrollStrategy::Top);
+        // Following means the end stays in view — until the reader takes
+        // hold of the list. Checked only when something arrived, because
+        // that is the only moment following would move anything: if the
+        // list was not at its end when the new lines came, the reader
+        // scrolled up to read something, and following drops rather than
+        // yanking them back down. The end is where the scroll was at the
+        // last layout, so a list we just scrolled ourselves gets a frame's
+        // grace before it can count as "the reader moved it".
+        let arrived = lines.len() != self.last_lines && !visible.is_empty();
+        if self.following && arrived {
+            match self.scroll.is_scrolled_to_end() {
+                Some(false) if !self.scrolled_last_frame => self.following = false,
+                _ => self.scroll.scroll_to_bottom(),
+            }
         }
+        self.scrolled_last_frame = self.following && arrived;
         self.last_lines = lines.len();
 
         let toolbar = h_flex()
@@ -1453,6 +1466,12 @@ impl Detail {
                 cx,
                 |this, cx| {
                     this.following = !this.following;
+                    if this.following {
+                        // *Follow* pressed is *jump to the end* as well: the
+                        // reader who scrolled up and is done reading wants
+                        // to be back where the new lines are.
+                        this.scroll.scroll_to_bottom();
+                    }
                     this.reload_log(cx);
                 },
             ))
