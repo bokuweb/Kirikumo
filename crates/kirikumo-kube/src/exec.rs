@@ -36,6 +36,9 @@ pub struct ExecRequest {
     /// is asked for by naming one, `["sh", "-c", "…"]`, which is what
     /// [`Self::shell`] does.
     pub command: Vec<String>,
+    /// Attached rather than collected: a tty, stdin open, and stderr folded
+    /// into stdout the way a terminal has it. What [`Self::attach`] asks for.
+    pub interactive: bool,
 }
 
 impl ExecRequest {
@@ -50,12 +53,33 @@ impl ExecRequest {
             pod: pod.into(),
             container: None,
             command: vec!["sh".into(), "-c".into(), line.to_string()],
+            interactive: false,
+        }
+    }
+
+    /// An interactive shell in a pod: `sh` on a tty with stdin open.
+    ///
+    /// `sh` for the reason [`Self::shell`] gives; a person who wants `bash`
+    /// can type it.
+    pub fn attach(namespace: impl Into<String>, pod: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            pod: pod.into(),
+            container: None,
+            command: vec!["sh".into()],
+            interactive: true,
         }
     }
 
     /// Run in one container.
     pub fn container(mut self, container: impl Into<String>) -> Self {
         self.container = Some(container.into());
+        self
+    }
+
+    /// Attach rather than collect.
+    pub fn interactive(mut self) -> Self {
+        self.interactive = true;
         self
     }
 
@@ -73,9 +97,20 @@ impl ExecRequest {
             parts.push(format!("command={}", encode(argument)));
         }
         parts.push("stdout=true".into());
-        parts.push("stderr=true".into());
-        parts.push("stdin=false".into());
-        parts.push("tty=false".into());
+        // With a tty there is no separate stderr: the kernel merges the two
+        // on the terminal, as it does on any terminal.
+        match self.interactive {
+            true => {
+                parts.push("stderr=false".into());
+                parts.push("stdin=true".into());
+                parts.push("tty=true".into());
+            }
+            false => {
+                parts.push("stderr=true".into());
+                parts.push("stdin=false".into());
+                parts.push("tty=false".into());
+            }
+        }
         parts.join("&")
     }
 }
@@ -184,6 +219,14 @@ pub fn take_frame(output: &mut ExecOutput, channel: u8, payload: &[u8]) -> bool 
     false
 }
 
+/// The message the resize channel takes: the apiserver's own field names.
+pub fn resize_message(cols: u16, rows: u16) -> Vec<u8> {
+    format!("{{\"Width\":{cols},\"Height\":{rows}}}").into_bytes()
+}
+
+/// The channel a resize goes on.
+pub const RESIZE: u8 = 4;
+
 /// The resource an access review asks about for exec: the `pods/exec`
 /// subresource, which is not in the catalogue because it cannot be listed.
 pub fn review_resource(pods: &crate::model::ApiResource) -> crate::model::ApiResource {
@@ -217,6 +260,20 @@ mod tests {
             "{query}"
         );
         assert!(query.ends_with("stdout=true&stderr=true&stdin=false&tty=false"));
+    }
+
+    #[test]
+    fn an_attached_shell_asks_for_a_tty_and_stdin_and_no_separate_stderr() {
+        let query = ExecRequest::attach("shop", "api").query();
+        assert!(query.contains("command=sh"), "{query}");
+        assert!(
+            query.ends_with("stdout=true&stderr=false&stdin=true&tty=true"),
+            "{query}"
+        );
+        assert_eq!(
+            String::from_utf8(resize_message(120, 40)).unwrap(),
+            r#"{"Width":120,"Height":40}"#
+        );
     }
 
     #[test]

@@ -37,6 +37,9 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["fo
 gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["tree-sitter-yaml"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 
+# The terminal emulator behind an attached shell: the one Ginka picked for
+# its own terminals, at the same version, so the two are one when they meet.
+alacritty_terminal = "0.26"
 anyhow = "1"
 # A channel a blocking watch thread can push into and a GPUI task can await:
 # the same shape Ginka's agent drivers use for their readers.

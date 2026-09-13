@@ -288,6 +288,47 @@ fn a_command_runs_in_a_container_and_reports_its_exit() {
 
 #[test]
 #[ignore = "needs a live cluster"]
+fn a_shell_can_be_attached_to_typed_at_and_resized() {
+    use kirikumo_kube::portforward::Poll;
+    let cluster = connect();
+    let mut shell = cluster
+        .attach(&kirikumo_kube::ExecRequest::attach(namespace(), "talker"))
+        .expect("attach");
+    shell.resize(100, 30).expect("resize");
+    // A tty echoes what is typed and then answers it.
+    shell.send(b"echo mark-$((40+2))\n").expect("stdin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        match shell.poll().expect("poll") {
+            Poll::Data(bytes) => {
+                seen.extend(bytes);
+                if String::from_utf8_lossy(&seen).contains("mark-42") {
+                    break;
+                }
+            }
+            Poll::Nothing => {}
+            Poll::Closed => panic!("the shell closed before answering"),
+        }
+    }
+    let screen = String::from_utf8_lossy(&seen);
+    assert!(screen.contains("mark-42"), "{screen}");
+    // `exit` ends the session: the status frame closes it.
+    shell.send(b"exit\n").expect("stdin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        if matches!(shell.poll().expect("poll"), Poll::Closed) {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "the session should end when the shell exits");
+    shell.close();
+}
+
+#[test]
+#[ignore = "needs a live cluster"]
 fn a_crds_printer_columns_evaluate_to_what_kubectl_prints() {
     // Needs the `widgets.example.kirikumo.dev` CRD and the `red-one` widget
     // the suite's setup applies (see the module doc).

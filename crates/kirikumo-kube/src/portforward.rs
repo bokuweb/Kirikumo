@@ -95,6 +95,14 @@ pub trait Tunnel: Send {
     /// Send bytes to the pod.
     fn send(&mut self, data: &[u8]) -> Result<()>;
 
+    /// Tell the far side the terminal is `cols` by `rows` now.
+    ///
+    /// Only an attached shell has anything to hear it; a port has no size,
+    /// so the default does nothing.
+    fn resize(&mut self, _cols: u16, _rows: u16) -> Result<()> {
+        Ok(())
+    }
+
     /// Close the pod's side.
     fn close(&mut self);
 }

@@ -639,6 +639,24 @@ impl Cluster for Rest {
         Ok(Box::new(WsTunnel {
             ws,
             opened: [false; 2],
+            mode: Mode::PortForward,
+        }))
+    }
+
+    fn attach(&self, request: &ExecRequest) -> Result<Box<dyn Tunnel>> {
+        let ws = self.websocket(
+            &format!(
+                "/api/v1/namespaces/{}/pods/{}/exec?{}",
+                request.namespace,
+                request.pod,
+                request.clone().interactive().query()
+            ),
+            "attach",
+        )?;
+        Ok(Box::new(WsTunnel {
+            ws,
+            opened: [true; 2],
+            mode: Mode::Terminal,
         }))
     }
 
@@ -768,15 +786,27 @@ fn host_and_port(base: &str) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
-/// One WebSocket to the apiserver, carrying one port.
+/// What a WebSocket to the apiserver is carrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// One port: data on channel 0, errors on 1, and an opening-port frame on
+    /// each.
+    PortForward,
+    /// A shell on a tty: stdin on 0, stdout on 1, the status on 3, resizes
+    /// on 4, and no opening frames.
+    Terminal,
+}
+
+/// One WebSocket to the apiserver, carrying one port or one shell.
 ///
-/// The first message on each channel opens with the port number
+/// For a port, the first message on each channel opens with the port number
 /// (`portforward::opening_port`); it is stripped once per channel and never
 /// handed to the local program.
 struct WsTunnel {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     /// Whether each channel's opening port message has been seen.
     opened: [bool; 2],
+    mode: Mode,
 }
 
 impl Tunnel for WsTunnel {
@@ -796,14 +826,19 @@ impl Tunnel for WsTunnel {
                     }
                     _ => payload,
                 };
-                match channel {
-                    portforward::DATA if payload.is_empty() => Ok(Poll::Nothing),
-                    portforward::DATA => Ok(Poll::Data(payload.to_vec())),
+                match (self.mode, channel) {
+                    (_, _) if payload.is_empty() => Ok(Poll::Nothing),
+                    (Mode::PortForward, portforward::DATA) => Ok(Poll::Data(payload.to_vec())),
                     // The apiserver's word on why the port is not there.
-                    portforward::ERROR if payload.is_empty() => Ok(Poll::Nothing),
-                    portforward::ERROR => Err(Error::Transport(
+                    (Mode::PortForward, portforward::ERROR) => Err(Error::Transport(
                         String::from_utf8_lossy(payload).into_owned(),
                     )),
+                    (Mode::Terminal, exec::STDOUT | exec::STDERR) => {
+                        Ok(Poll::Data(payload.to_vec()))
+                    }
+                    // The shell exited: the status says how, and the
+                    // session is over either way.
+                    (Mode::Terminal, exec::STATUS) => Ok(Poll::Closed),
                     _ => Ok(Poll::Nothing),
                 }
             }
@@ -826,11 +861,23 @@ impl Tunnel for WsTunnel {
     }
 
     fn send(&mut self, data: &[u8]) -> Result<()> {
+        // Channel 0 in both modes: the port's data, or the shell's stdin.
         self.ws
             .send(Message::Binary(
-                portforward::frame(portforward::DATA, data).into(),
+                portforward::frame(exec::STDIN, data).into(),
             ))
-            .map_err(|error| Error::Transport(format!("port-forward: {error}")))
+            .map_err(|error| Error::Transport(format!("tunnel: {error}")))
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        if self.mode != Mode::Terminal {
+            return Ok(());
+        }
+        self.ws
+            .send(Message::Binary(
+                portforward::frame(exec::RESIZE, &exec::resize_message(cols, rows)).into(),
+            ))
+            .map_err(|error| Error::Transport(format!("resize: {error}")))
     }
 
     fn close(&mut self) {

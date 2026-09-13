@@ -12,6 +12,7 @@
 //! revalidation out of.
 
 use gpui::{AppContext as _, Context, EventEmitter};
+use kirikumo_kube::portforward::{POLL, Poll};
 use kirikumo_kube::watch::Backoff;
 use kirikumo_kube::{
     ApiResource, Applied, Catalogue, Cluster, ClusterVersion, ContextRef, EventRecord, ExecOutput,
@@ -20,9 +21,10 @@ use kirikumo_kube::{
 };
 use kirikumo_ui::Fetch;
 use kirikumo_ui::fetch::describe;
+use kirikumo_ui::terminal::Screen;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 /// Which list: a kind, scoped to a namespace or to all of them.
 pub type ListKey = (ResourceKey, Option<String>);
@@ -97,6 +99,13 @@ pub struct Store {
     /// Every local port being forwarded to a pod. Dropped with the store, or
     /// on a change of context: a forward is a hole into one cluster.
     forwards: Vec<ActiveForward>,
+    /// The shell attached to a pod, if one is. One at a time: the panel
+    /// shows one pod, and a shell nobody can see is a thread and a socket
+    /// for nothing.
+    shell: Option<ShellSession>,
+    /// Bumped for every shell attached, so bytes from one that has been
+    /// detached are recognised and dropped.
+    shell_generation: u64,
     /// The list the window is looking at, and so the only one worth
     /// following. A cluster with ten thousand pods must not be streamed
     /// because the sidebar mentions pods (roadmap §4.7).
@@ -123,6 +132,61 @@ impl ActiveForward {
     pub fn local(&self) -> u16 {
         self.forwarder.local_port()
     }
+}
+
+/// Where an attached shell is in its life.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellStatus {
+    /// The websocket is being opened.
+    Connecting,
+    /// Bytes are flowing.
+    Open,
+    /// The shell exited, or the pod closed the connection.
+    Closed,
+    /// It could not be opened, or the connection broke: why.
+    Failed(String),
+}
+
+/// A shell attached to a pod: its screen, and the way to reach it.
+///
+/// The tunnel itself lives on the pump thread, which is the only thing that
+/// touches it; what is typed and the size go to it over a channel. The
+/// screen lives here, on the UI thread, fed from what the pump sends back.
+pub struct ShellSession {
+    /// Which pod.
+    pub pod: ObjectKey,
+    /// Which container, when one was named.
+    pub container: Option<String>,
+    /// What the shell has drawn.
+    pub screen: Screen,
+    /// Where it is.
+    pub status: ShellStatus,
+    /// Which generation it belongs to.
+    generation: u64,
+    /// Keystrokes and resizes, for the pump to pass on.
+    input: mpsc::Sender<ShellInput>,
+    /// Set when it is abandoned; the pump notices at its next poll.
+    stop: Arc<AtomicBool>,
+}
+
+/// What the UI thread sends a shell's pump.
+enum ShellInput {
+    /// Bytes to type.
+    Bytes(Vec<u8>),
+    /// The panel is `cols` by `rows` now.
+    Resize(u16, u16),
+}
+
+/// What a shell's pump sends back.
+enum ShellOutput {
+    /// Bytes the shell printed.
+    Bytes(Vec<u8>),
+    /// The tunnel is open and bytes may be typed.
+    Opened,
+    /// The pod closed it.
+    Closed,
+    /// It could not be opened or it broke: why.
+    Failed(String),
 }
 
 /// A log being followed, and the way to tell it to stop.
@@ -176,6 +240,8 @@ impl Store {
             runs: HashMap::new(),
             exec_permissions: HashMap::new(),
             forwards: Vec::new(),
+            shell: None,
+            shell_generation: 0,
             followed: None,
             watch: None,
             generation: 0,
@@ -251,6 +317,7 @@ impl Store {
         // Dropping a forwarder stops it: nothing from the last cluster may
         // stay reachable on `localhost` under the new one's name.
         self.forwards.clear();
+        self.detach_shell();
         self.stop_watch();
         self.followed = None;
         cx.emit(StoreEvent::Changed);
@@ -968,6 +1035,133 @@ impl Store {
         cx.notify();
     }
 
+    /// The shell attached to a pod, if one is.
+    pub fn shell(&self) -> Option<&ShellSession> {
+        self.shell.as_ref()
+    }
+
+    /// Attach a shell to a pod, `cols` by `rows`.
+    ///
+    /// Any shell already attached — to this pod or another — is detached
+    /// first. The websocket is opened on a thread of its own, which then
+    /// pumps: what is typed goes down it between polls, what comes back is
+    /// fed to the screen here.
+    pub fn attach_shell(
+        &mut self,
+        pod: ObjectKey,
+        request: ExecRequest,
+        cols: u16,
+        rows: u16,
+        cx: &mut Context<Self>,
+    ) {
+        self.detach_shell();
+        self.shell_generation += 1;
+        let generation = self.shell_generation;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (input, inbox) = mpsc::channel::<ShellInput>();
+        let (sender, receiver) = async_channel::unbounded::<ShellOutput>();
+        let container = request.container.clone();
+        let cluster = self.cluster.clone();
+        let started = std::thread::Builder::new()
+            .name(format!("kirikumo-shell-{}", request.pod))
+            .spawn({
+                let stop = stop.clone();
+                move || pump_shell(cluster, request, (cols, rows), inbox, stop, sender)
+            });
+        if let Err(error) = started {
+            tracing::warn!(%error, "could not start a shell");
+            return;
+        }
+        self.shell = Some(ShellSession {
+            pod,
+            container,
+            screen: Screen::new(cols, rows),
+            status: ShellStatus::Connecting,
+            generation,
+            input,
+            stop,
+        });
+        cx.spawn(async move |this, cx| {
+            while let Ok(message) = receiver.recv().await {
+                let carry_on = this
+                    .update(cx, |this, cx| this.on_shell_output(generation, message, cx))
+                    .unwrap_or(false);
+                if !carry_on {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.emit(StoreEvent::Changed);
+        cx.notify();
+    }
+
+    /// Type into the attached shell.
+    pub fn type_into_shell(&mut self, bytes: Vec<u8>) {
+        if let Some(shell) = &self.shell
+            && shell.status == ShellStatus::Open
+        {
+            let _ = shell.input.send(ShellInput::Bytes(bytes));
+        }
+    }
+
+    /// Tell the attached shell the panel is `cols` by `rows` now.
+    ///
+    /// The screen is resized here at once and the shell told afterwards, so
+    /// the two agree by the time the shell redraws.
+    pub fn resize_shell(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
+        if let Some(shell) = &mut self.shell
+            && shell.screen.resize(cols, rows)
+        {
+            let _ = shell.input.send(ShellInput::Resize(cols, rows));
+            cx.notify();
+        }
+    }
+
+    /// Detach the shell, if one is attached.
+    pub fn detach_shell(&mut self) {
+        if let Some(shell) = self.shell.take() {
+            shell.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Something from the shell's pump, and whether to keep listening.
+    fn on_shell_output(
+        &mut self,
+        generation: u64,
+        message: ShellOutput,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(shell) = self
+            .shell
+            .as_mut()
+            .filter(|shell| shell.generation == generation)
+        else {
+            return false;
+        };
+        let carry_on = match message {
+            ShellOutput::Opened => {
+                shell.status = ShellStatus::Open;
+                true
+            }
+            ShellOutput::Bytes(bytes) => {
+                shell.screen.feed(&bytes);
+                true
+            }
+            ShellOutput::Closed => {
+                shell.status = ShellStatus::Closed;
+                false
+            }
+            ShellOutput::Failed(why) => {
+                shell.status = ShellStatus::Failed(why);
+                false
+            }
+        };
+        cx.emit(StoreEvent::Changed);
+        cx.notify();
+        carry_on
+    }
+
     /// Ask the cluster who it is, what it serves and what namespaces it has.
     ///
     /// The three questions every other question depends on, asked once per
@@ -1163,6 +1357,75 @@ fn pump_log(
         let message = line.map_err(|error| describe(&error));
         let failed = message.is_err();
         if sender.send_blocking(message).is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// One shell, opened and then pumped on a thread of its own.
+///
+/// The thread owns the tunnel outright — nothing else touches it, so there
+/// is no lock for a keystroke to wait on. Each turn sends whatever has been
+/// typed, then polls for at most `portforward::POLL`; a shell that says
+/// nothing costs that much per turn and nothing else. Returns when told to
+/// stop, when the pod closes the shell, or when the window has gone.
+fn pump_shell(
+    cluster: Arc<dyn Cluster>,
+    request: ExecRequest,
+    (cols, rows): (u16, u16),
+    inbox: mpsc::Receiver<ShellInput>,
+    stop: Arc<AtomicBool>,
+    sender: async_channel::Sender<ShellOutput>,
+) {
+    let mut tunnel = match cluster.attach(&request) {
+        Ok(tunnel) => tunnel,
+        Err(error) => {
+            let _ = sender.send_blocking(ShellOutput::Failed(describe(&error)));
+            return;
+        }
+    };
+    // The size the panel had when it asked, before the shell draws its
+    // first prompt at the default eighty by twenty-four.
+    let _ = tunnel.resize(cols, rows);
+    if sender.send_blocking(ShellOutput::Opened).is_err() {
+        tunnel.close();
+        return;
+    }
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            tunnel.close();
+            return;
+        }
+        let sent = (|| -> kirikumo_kube::Result<()> {
+            while let Ok(input) = inbox.try_recv() {
+                match input {
+                    ShellInput::Bytes(bytes) => tunnel.send(&bytes)?,
+                    ShellInput::Resize(cols, rows) => tunnel.resize(cols, rows)?,
+                }
+            }
+            Ok(())
+        })();
+        let turn = std::time::Instant::now();
+        let outcome = match sent.and_then(|()| tunnel.poll()) {
+            Ok(Poll::Data(bytes)) => sender
+                .send_blocking(ShellOutput::Bytes(bytes))
+                .map(|()| true),
+            Ok(Poll::Nothing) => {
+                // A tunnel that answers "nothing" at once — the scripted
+                // one — would otherwise spin this thread; the real one has
+                // already waited its turn on the socket.
+                if let Some(rest) = POLL.checked_sub(turn.elapsed()) {
+                    std::thread::sleep(rest);
+                }
+                Ok(true)
+            }
+            Ok(Poll::Closed) => sender.send_blocking(ShellOutput::Closed).map(|()| false),
+            Err(error) => sender
+                .send_blocking(ShellOutput::Failed(describe(&error)))
+                .map(|()| false),
+        };
+        if !matches!(outcome, Ok(true)) {
+            tunnel.close();
             return;
         }
     }

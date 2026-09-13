@@ -158,6 +158,15 @@ pub trait Cluster: Send + Sync {
         Err(Error::Unsupported)
     }
 
+    /// Attach to a shell in a container: a tty, stdin open, and a tunnel
+    /// whose bytes are the terminal's.
+    ///
+    /// The tunnel is polled on a thread of its own, like a port-forward's;
+    /// what is typed goes back down it, and a resize goes on its own channel.
+    fn attach(&self, _request: &ExecRequest) -> Result<Box<dyn Tunnel>> {
+        Err(Error::Unsupported)
+    }
+
     /// Ask a pod to leave, through the Eviction API.
     ///
     /// Unlike a delete this honours a `PodDisruptionBudget`: when the budget

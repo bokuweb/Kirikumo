@@ -24,12 +24,12 @@ use crate::model::{
     ApiResource, Catalogue, ClusterVersion, EventRecord, LogRequest, Metrics, Object, ObjectList,
     Patch, ResourceKey,
 };
-use crate::portforward::{Echo, Tunnel};
+use crate::portforward::{Echo, Poll, Tunnel};
 use crate::watch::{WatchEvent, WatchStream};
 use crate::{Cluster, discovery};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration as Wait;
 
@@ -573,6 +573,19 @@ impl Cluster for Scripted {
         Ok(Box::new(Echo::new()))
     }
 
+    /// A shell on the demo cluster is a scripted one: it echoes what is
+    /// typed, answers `echo`, and says "not found" to everything else — enough
+    /// to see the terminal draw, wrap and resize with nothing behind it.
+    fn attach(&self, request: &ExecRequest) -> Result<Box<dyn Tunnel>> {
+        let pods = self
+            .catalogue
+            .get(&ResourceKey::new("", "Pod"))
+            .cloned()
+            .ok_or_else(|| Error::NotFound("pods".into()))?;
+        self.get(&pods, Some(&request.namespace), &request.pod)?;
+        Ok(Box::new(ScriptedShell::new(&request.pod)))
+    }
+
     fn evict(&self, namespace: &str, name: &str) -> Result<()> {
         if self.protected.contains(&format!("{namespace}/{name}")) {
             return Err(Error::Api {
@@ -1001,6 +1014,122 @@ const SAMPLE_LOG: &str = "\
 2026-09-07T09:16:33.410Z INFO  GET /healthz 200 0.3ms
 ";
 
+/// The shell behind [`Scripted::attach`].
+///
+/// A line editor and two commands: `echo` prints its arguments and `exit`
+/// closes the tunnel. Everything else is "not found", the way a real `sh`
+/// would say it. Input is echoed back as a terminal in cooked mode would
+/// echo it, so the screen shows what was typed.
+#[derive(Debug)]
+pub struct ScriptedShell {
+    /// What the shell has printed and the pump has not yet read.
+    output: VecDeque<u8>,
+    /// The line being typed.
+    line: String,
+    /// The prompt, which names the pod so two shells are told apart.
+    prompt: String,
+    /// The size it was last told, for tests.
+    size: (u16, u16),
+    closed: bool,
+}
+
+impl ScriptedShell {
+    /// A shell on a pod, prompt already printed.
+    pub fn new(pod: &str) -> Self {
+        let prompt = format!("{pod}:/ $ ");
+        let mut shell = Self {
+            output: VecDeque::new(),
+            line: String::new(),
+            prompt,
+            size: (80, 24),
+            closed: false,
+        };
+        shell.print(&shell.prompt.clone());
+        shell
+    }
+
+    /// The size the shell was last told it has, as `(cols, rows)`.
+    pub fn size(&self) -> (u16, u16) {
+        self.size
+    }
+
+    fn print(&mut self, text: &str) {
+        self.output.extend(text.as_bytes());
+    }
+
+    /// Run the line that was just entered.
+    fn run(&mut self) {
+        let line = std::mem::take(&mut self.line);
+        let mut words = line.split_whitespace();
+        match words.next() {
+            None => {}
+            Some("exit") => {
+                self.closed = true;
+                return;
+            }
+            Some("echo") => {
+                let rest = words.collect::<Vec<_>>().join(" ");
+                self.print(&format!("{rest}\r\n"));
+            }
+            Some(command) => self.print(&format!("sh: {command}: not found\r\n")),
+        }
+        let prompt = self.prompt.clone();
+        self.print(&prompt);
+    }
+}
+
+impl Tunnel for ScriptedShell {
+    fn poll(&mut self) -> Result<Poll> {
+        if !self.output.is_empty() {
+            return Ok(Poll::Data(self.output.drain(..).collect()));
+        }
+        match self.closed {
+            true => Ok(Poll::Closed),
+            false => Ok(Poll::Nothing),
+        }
+    }
+
+    fn send(&mut self, data: &[u8]) -> Result<()> {
+        for &byte in data {
+            match byte {
+                b'\r' | b'\n' => {
+                    self.print("\r\n");
+                    self.run();
+                }
+                // Backspace: rub the character out on screen too.
+                0x7f | 0x08 => {
+                    if self.line.pop().is_some() {
+                        self.print("\x08 \x08");
+                    }
+                }
+                // ctrl-c: abandon the line.
+                0x03 => {
+                    self.line.clear();
+                    let prompt = self.prompt.clone();
+                    self.print(&format!("^C\r\n{prompt}"));
+                }
+                // ctrl-d on an empty line: the shell exits.
+                0x04 if self.line.is_empty() => self.closed = true,
+                byte if byte.is_ascii_control() => {}
+                byte => {
+                    self.line.push(byte as char);
+                    self.output.push_back(byte);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.size = (cols, rows);
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,5 +1420,45 @@ mod tests {
         let shop = cluster.pod_metrics(Some("shop")).unwrap();
         assert!(shop.len() < all.len());
         assert!(shop.iter().all(|m| m.namespace.as_deref() == Some("shop")));
+    }
+
+    fn drain(shell: &mut dyn Tunnel) -> String {
+        let mut out = Vec::new();
+        while let Poll::Data(bytes) = shell.poll().unwrap() {
+            out.extend(bytes);
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_scripted_shell_echoes_answers_and_exits() {
+        let cluster = Scripted::sample();
+        let mut shell = cluster
+            .attach(&ExecRequest::attach("shop", "web-6b4c5d-lm2zp"))
+            .unwrap();
+        assert_eq!(drain(shell.as_mut()), "web-6b4c5d-lm2zp:/ $ ");
+        shell.send(b"echo hi\r").unwrap();
+        assert_eq!(
+            drain(shell.as_mut()),
+            "echo hi\r\nhi\r\nweb-6b4c5d-lm2zp:/ $ "
+        );
+        shell.send(b"lx\x7fs\r").unwrap();
+        assert_eq!(
+            drain(shell.as_mut()),
+            "lx\x08 \x08s\r\nsh: ls: not found\r\nweb-6b4c5d-lm2zp:/ $ "
+        );
+        shell.resize(120, 40).unwrap();
+        shell.send(b"exit\r").unwrap();
+        drain(shell.as_mut());
+        assert!(matches!(shell.poll().unwrap(), Poll::Closed));
+    }
+
+    #[test]
+    fn a_shell_needs_a_pod_that_exists() {
+        let cluster = Scripted::sample();
+        assert!(matches!(
+            cluster.attach(&ExecRequest::attach("shop", "nope")),
+            Err(Error::NotFound(_))
+        ));
     }
 }

@@ -16,11 +16,11 @@ It is the third window in a family that becomes one application: **Ginka** (codi
 
 ## Current state
 
-**M0 to M5 have landed, an interactive terminal excepted (roadmap Q6); the mount into Ginka is deferred — the app stands alone for now.** Everything that talks to a cluster has been run against a real one (`crates/kirikumo-kube/tests/live.rs`, a `kind` cluster). The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns — a custom resource's from its CRD, evaluated as JSONPath here — a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
+**M0 to M5 have landed; the mount into Ginka is deferred — the app stands alone for now.** Everything that talks to a cluster has been run against a real one (`crates/kirikumo-kube/tests/live.rs`, a `kind` cluster). The window opens frameless over a blurred desktop with three resizable columns; the kubeconfig layer merges `KUBECONFIG` and authenticates by certificate, token, token file or exec plugin; discovery builds the sidebar's tree, custom resources included; one virtualized table draws every kind with `kubectl get`'s columns — a custom resource's from its CRD, evaluated as JSONPath here — a health mark, a namespace picker and a fuzzy filter; and the detail panel has Overview, Events, YAML and Logs. Switching context rebuilds the connection and clears the last cluster's data.
 
 **The table is live.** The list on screen — and only that one — is followed: a thread reads the watch, bookmarks keep the resume point moving, a `410 Gone` re-lists, a dropped connection backs off, and only the rows whose objects actually moved are formatted again. `KIRIKUMO_DEMO=1` has a scripted watch, so the whole path can be exercised without a cluster.
 
-`⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, reports what a pod or node is using when the cluster has a metrics server, and **follows a container's log** with a previous-instance toggle and a literal find. **It can act**: scale, restart, cordon/uncordon/drain, delete, and apply an edited manifest, each behind a second button that names the object and each greyed out when RBAC says no. **A pod's ports forward to `localhost`** from a chip, one WebSocket per local connection, and **a command runs in a container** from a *Run* tab, with its output and exit code. What is *not* there yet: an interactive terminal. See `docs/roadmap.md` §5.
+`⌘K` reaches every kind, namespace, context and command by name; the detail panel links up to an object's controller and node and down to what a selector selects, reports what a pod or node is using when the cluster has a metrics server, and **follows a container's log** with a previous-instance toggle and a literal find. **It can act**: scale, restart, cordon/uncordon/drain, delete, and apply an edited manifest, each behind a second button that names the object and each greyed out when RBAC says no. **A pod's ports forward to `localhost`** from a chip, one WebSocket per local connection, **a command runs in a container** from a *Run* tab, with its output and exit code, and **a shell attaches to a container** on a *Shell* tab, drawn by `alacritty_terminal` at the version Ginka uses. See `docs/roadmap.md` §5.
 
 ## Commands
 
@@ -30,7 +30,7 @@ cargo run --release
 KIRIKUMO_DEMO=1 cargo run                   # the same window over a scripted cluster, no network
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_PALETTE=1 cargo run   # ...opened on the palette, for screenshots
 KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN=Pod/shop/api-7d9f8c-2xk4t cargo run   # ...opened on one object
-KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Pod/shop/api-7d9f8c-2xk4t#logs' cargo run  # ...on its log, following (#events, #yaml, #run too)
+KIRIKUMO_DEMO=1 KIRIKUMO_DEMO_OPEN='Pod/shop/api-7d9f8c-2xk4t#logs' cargo run  # ...on its log, following (#events, #yaml, #run, #shell too)
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all

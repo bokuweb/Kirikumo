@@ -1,7 +1,7 @@
 # Kirikumo Roadmap
 
 > The authoritative document for this repository. `AGENTS.md` is the short version; `docs/ui.md` says what it looks like.
-> Last updated: 2026-09-12
+> Last updated: 2026-09-13
 
 ## 1. Vision
 
@@ -48,7 +48,7 @@ So every decision here is made twice: once for the standalone window, and once f
 - **No Helm, no charts, no marketplace.** Lens's chart catalogue is a package manager wearing a viewer's clothes.
 - **No multi-cluster aggregation.** One context at a time; switching is cheap.
 - **No metrics history and no Prometheus.** Instantaneous use from `metrics.k8s.io`, nothing stored.
-- **No interactive terminal.** A command can be run in a container and its output read (M5); an interactive shell needs a terminal emulator, and that is the question §7 Q6 asks.
+- **No terminal into the machine.** A shell into a *container* is there (M5); a shell on a node, or on the desktop, is what Ginka's terminal dock is for.
 
 ## 4. Architecture
 
@@ -212,7 +212,9 @@ Before writing a widget, check `gpui-component`'s gallery for an existing one.
 - **English and Japanese.** Every user-visible string is in `locales/app.yml` in both.
 - `KIRIKUMO_DEMO=1` runs the whole window over a scripted cluster with something wrong in it, and no network — including a scripted *watch*, so the demo shows a pod restarting, one arriving and one going away without a cluster anywhere.
 
-What is *not* there yet: an interactive terminal (Q6). The mount into Ginka's window is deferred; the app stands alone.
+- **A shell into a container.** A *Shell* tab attaches a tty over the exec WebSocket and draws it through `alacritty_terminal` — the emulator Ginka uses, at the same version, so the two are one when they meet (K6 is honoured: attaching is a button on the pod, and a shell only does what is typed into it).
+
+Nothing in M0–M5 is outstanding. The mount into Ginka's window is deferred; the app stands alone.
 
 | # | Name | What lands | Owes |
 | --- | --- | --- | --- |
@@ -221,7 +223,7 @@ What is *not* there yet: an interactive terminal (Q6). The mount into Ginka's wi
 | **M2** | Live | Watches wired to the store with bookmarks and re-list, rows updated in place rather than rebuilt, `⌘F`/`⌘L`/`⌘K` | **Landed.** Backoff tuning against a real flaky apiserver rather than a scripted one |
 | **M3** | Pods in depth | Logs following, with find and the previous instance; `metrics.k8s.io` for nodes and pods; owner/child navigation | **Landed.** Wrapping long log lines (needs a variable-height virtualized list); metrics in the *table* as well as the panel, which needs a column set that depends on what the cluster can answer, and rows that go stale on a clock rather than on a version |
 | **M4** | Acting | Delete, scale, restart, cordon/uncordon/drain, apply an edited YAML — each behind a confirmation that names the object, each greyed out when `SelfSubjectAccessReview` says no (K6) | **Landed.** |
-| **M5** | Reaching in | Port-forward over WebSocket, one tunnel per local connection, from a chip on the pod; a command run in a container with its output and exit code on a *Run* tab — **both landed and verified against a `kind` cluster** (`tests/live.rs`); the mount into Ginka's window, **deferred** — the app stands alone for now (§8, 2026-09-12) | An interactive terminal (Q6) |
+| **M5** | Reaching in | Port-forward over WebSocket, one tunnel per local connection, from a chip on the pod; a command run in a container with its output and exit code on a *Run* tab; an interactive shell on a *Shell* tab, drawn by `alacritty_terminal` — **all three landed and verified against a `kind` cluster** (`tests/live.rs`); the mount into Ginka's window, **deferred** — the app stands alone for now (§8, 2026-09-12) | **Landed.** |
 
 ## 6. Quality bars
 
@@ -237,7 +239,7 @@ What is *not* there yet: an interactive terminal (Q6). The mount into Ginka's wi
 | --- | --- | --- |
 | **Q1** | Does the sidebar's resource tree get folded into Ginka's sidebar, or does the cluster surface carry its own tree in the right panel? | Open. The tree is deep enough that Ginka's sidebar may not want it; decide before M5, not during it. |
 | **Q2** | Exec and port-forward: WebSocket with `tungstenite`, or `kube-rs` — and with it tokio? | **Resolved for port-forward: `tungstenite`**, over a `rustls` configuration built from the kubeconfig (`kirikumo_kube::tls`). The channel protocol is a byte and two bytes of port; a hundred lines against the scripted cluster and a local echo. `kube-rs` stays out, K3 stays whole, and the question is asked once more only if exec (Q6) turns out to need SPDY. |
-| **Q6** | An *interactive* terminal into a container needs a terminal emulator. Ginka has one (`alacritty_terminal`); does this app grow its own, or wait for the mount? | Narrowed. Non-interactive exec landed — a command, its output, its exit code — which is most of what a viewer needs, and the wire side (the same WebSocket as a port-forward with three more channels) is done and verified. What remains is drawing a terminal: stdin, a tty, resize, and an emulator. That is a surface Ginka already owns, so it waits either for the mount or for a decision that it is worth having twice. |
+| **Q6** | An *interactive* terminal into a container needs a terminal emulator. Ginka has one (`alacritty_terminal`); does this app grow its own, or wait for the mount? | **Resolved: it has one, on the same emulator.** With the mount deferred, waiting meant not having it. `kirikumo_ui::terminal` wraps `alacritty_terminal` at Ginka's version into a `Screen` a view draws as styled runs, and the store pumps one attached tty on a thread of its own — the same shape as a followed log. What Ginka owns is the *dock*; the emulator is a crate, and two wrappers of the same crate fold into one on the day of the mount (§8, 2026-09-13). |
 | **Q5** | Do the table's columns come from the apiserver instead of from a list in the source? | **Resolved, the other way round.** The columns a custom resource wants are declared in its CRD as JSONPath (`additionalPrinterColumns`), and the apiserver's `Table` form is only the server evaluating them. Evaluating them *here*, against the objects the window already holds, gives every custom kind the table its authors designed with no second copy of any list, and leaves the watch, the row reuse and the health mark exactly as they were. A subset of JSONPath is enough — the one filter form every CRD uses, `[?(@.type=="Ready")]`, and not much else — and it is verified live against a CRD on `kind`. Built-in kinds keep the hand-written sets, which are `kubectl`'s. |
 | **Q3** | Licence | Open, as in Ginka. Nothing copied in, so nothing is settled by accident. |
 | **Q4** | Does a shared `glass-tokens` crate get extracted for the three apps, or does each keep its own copy of `Tokens`? | Extract at unification, not before: three copies of a 400-line file that must stay identical is a smell, but a shared crate before there is a host is speculative. |
@@ -273,3 +275,4 @@ What is *not* there yet: an interactive terminal (Q6). The mount into Ginka's wi
 | 2026-09-13 | A live suite against a real apiserver, ignored by default (`crates/kirikumo-kube/tests/live.rs`) | The scripted cluster is right for every change, and wrong for the one question it cannot answer: whether the wire is what we think it is. The first run against `kind` found two things the fake could not — the log subresource refuses `Accept: text/plain` with a 406, and a pod evicted a second ago has nothing listening yet — and both are now in the suite. It writes to the cluster, so it is never run by accident: `--ignored`, one thread, and the drain named to sort last. |
 | 2026-09-13 | Exec is non-interactive first: a command in, its output and exit code out, no tty | It is most of what a viewer needs from exec — what is in that file, what does `env` say, is the process there — and it needs no terminal emulator, which is the whole cost of the interactive kind. The wire is the same WebSocket as a port-forward with three more channels, and it is verified live. A command is the reader's own typed words, which is the deliberate act K6 asks for; the `pods/exec` review gates it like a write. stdout and stderr are shown one after the other rather than interleaved, because they are separate channels and the apiserver does not order them against each other — interleaving them here would be inventing an order. |
 | 2026-09-13 | A custom resource's columns are its CRD's `additionalPrinterColumns`, evaluated here as JSONPath | Q5 asked whether to let the apiserver print the table. The apiserver only evaluates the same JSONPath the CRD declares, so evaluating it here costs one list of CRDs per connection and keeps every object-shaped thing — the watch, the reused rows, the health mark — as it was. The evaluator is a subset: dotted and bracketed keys, indexes, `[*]`, and the `[?(@.key=="value")]` filter, which is the one form real CRDs actually write. Anything outside it is an empty cell, which is also what `kubectl` shows for a path it cannot follow. Verified against a CRD on `kind`: the cells match `kubectl get -o wide` character for character. |
+| 2026-09-13 | The interactive shell is drawn here, on `alacritty_terminal` at Ginka's version, rather than waiting for the mount | The mount is deferred and a viewer without a shell into a container sends its reader to a terminal for the one thing Lens is opened for most. The emulator is a dependency, not a surface: `kirikumo_ui::terminal::Screen` is a thin wrapper that yields rows of styled spans, and the same wrapper exists in Ginka over the same crate at the same version, so unifying them is a move, not a rewrite (K6 in §4.3). The tunnel lives on one thread that owns it outright — keystrokes and resizes reach it over a channel, output comes back over another — so no lock sits between a keystroke and the wire. The panel measures itself in cells every frame and tells the shell only when the number changes. One shell at a time, dropped when the panel moves to another object: a shell nobody can see is a thread and a socket for nothing. |

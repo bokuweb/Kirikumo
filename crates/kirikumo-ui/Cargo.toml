@@ -7,6 +7,7 @@ description = "Design tokens, assets, settings and view models: everything UI-si
 
 [dependencies]
 kirikumo-kube.workspace = true
+alacritty_terminal.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true

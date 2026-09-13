@@ -1,15 +1,15 @@
 //! The right panel: `docs/ui.md` §3.4.
 //!
-//! Four tabs over one object — Overview, Events, YAML, and Logs for anything
-//! with containers. What each of them says is decided in `kirikumo_ui`
-//! (`detail::overview`) or in `kirikumo_kube` (`yaml::to_yaml`); this file
-//! draws it.
+//! Six tabs over one object — Overview, Events, YAML, and for anything with
+//! containers Logs, Run and Shell. What each of them says is decided in
+//! `kirikumo_ui` (`detail::overview`, `terminal::Screen`) or in
+//! `kirikumo_kube` (`yaml::to_yaml`); this file draws it.
 //!
 //! The object itself is read out of the list the table is already showing
 //! rather than fetched again: it arrived a moment ago, and a `GET` for it
 //! would put a spinner over data the window already has.
 
-use crate::store::{ObjectKey, Store, StoreEvent, Write};
+use crate::store::{ObjectKey, ShellStatus, Store, StoreEvent, Write};
 use chrono::Utc;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -20,11 +20,18 @@ use kirikumo_kube::{Action, ExecRequest, LogRequest, Object, actions, yaml};
 use kirikumo_ui::actions::{Pending, confirm_label};
 use kirikumo_ui::assets::icon;
 use kirikumo_ui::detail::Target;
+use kirikumo_ui::terminal::{self, Style};
 use kirikumo_ui::{Tokens, detail, logs, time};
 use serde_json::Value;
 
 /// How tall one line of YAML or of a log is.
 const LINE_HEIGHT: Pixels = px(17.);
+
+/// The size the shell's text is drawn at.
+const SHELL_FONT_SIZE: Pixels = px(12.5);
+
+/// The size a shell is told before its panel has been measured.
+const SHELL_DEFAULT: (u16, u16) = (80, 24);
 
 /// Which tab is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +46,8 @@ pub enum Tab {
     Logs,
     /// A command, run in a container.
     Run,
+    /// A shell attached to a container.
+    Shell,
 }
 
 impl Tab {
@@ -50,6 +59,7 @@ impl Tab {
             Self::Yaml => "detail.yaml",
             Self::Logs => "detail.logs",
             Self::Run => "detail.run",
+            Self::Shell => "detail.shell",
         }
     }
 }
@@ -102,6 +112,16 @@ pub struct Detail {
     forward_error: Option<String>,
     /// The command field on the Run tab.
     command: Entity<InputState>,
+    /// Keyboard focus for the Shell tab: what is typed while it has focus
+    /// goes to the shell, and nowhere else.
+    shell_focus: FocusHandle,
+    /// The shell panel's size in cells at the last frame, so a resize is
+    /// noticed and a frame that changed nothing costs nothing.
+    shell_cells: Option<(u16, u16)>,
+    /// A shell asked for before the cluster has said whether it may be
+    /// opened; attached the moment it says yes. For demos, which open the
+    /// tab and expect a prompt in it.
+    attach_when_allowed: bool,
 }
 
 impl Detail {
@@ -172,6 +192,9 @@ impl Detail {
             apply_error: None,
             forward_error: None,
             command,
+            shell_focus: cx.focus_handle(),
+            shell_cells: None,
+            attach_when_allowed: false,
         }
     }
 
@@ -181,8 +204,9 @@ impl Detail {
             // A different object: the tab stays, because a reader stepping
             // down a list of pods with the YAML tab open wants the next
             // pod's YAML — but the container does not, since it named one
-            // of the last object's.
+            // of the last object's, and neither does a shell into it.
             self.container = None;
+            self.store.update(cx, |store, _| store.detach_shell());
         }
         self.key = Some(key);
         // A write armed on one object must not fire on the next.
@@ -199,6 +223,7 @@ impl Detail {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.key = None;
         self.stop_following(cx);
+        self.store.update(cx, |store, _| store.detach_shell());
         cx.notify();
     }
 
@@ -243,8 +268,10 @@ impl Detail {
             "yaml" => Tab::Yaml,
             "logs" => Tab::Logs,
             "run" => Tab::Run,
+            "shell" => Tab::Shell,
             _ => Tab::Overview,
         };
+        self.attach_when_allowed = tab == Tab::Shell;
         self.set_tab(tab, cx);
     }
 
@@ -318,10 +345,15 @@ impl Detail {
                     }
                 }
             }
-            Tab::Run => {
+            Tab::Run | Tab::Shell => {
                 let namespace = object.meta.namespace.clone();
+                let allowed = self.store.read(cx).exec_permission(namespace.as_deref());
                 self.store
                     .update(cx, |store, cx| store.ensure_exec_permission(namespace, cx));
+                if self.tab == Tab::Shell && self.attach_when_allowed && allowed.is_some() {
+                    self.attach_when_allowed = false;
+                    self.attach_shell(cx);
+                }
             }
             Tab::Overview | Tab::Yaml => {}
         }
@@ -434,7 +466,14 @@ impl Detail {
         let tokens = Tokens::global(cx).clone();
         let has_containers = !self.containers(cx).is_empty();
         let tabs: Vec<Tab> = match has_containers {
-            true => vec![Tab::Overview, Tab::Events, Tab::Yaml, Tab::Logs, Tab::Run],
+            true => vec![
+                Tab::Overview,
+                Tab::Events,
+                Tab::Yaml,
+                Tab::Logs,
+                Tab::Run,
+                Tab::Shell,
+            ],
             false => vec![Tab::Overview, Tab::Events, Tab::Yaml],
         };
         h_flex()
@@ -1382,6 +1421,306 @@ impl Detail {
             .into_any_element()
     }
 
+    /// Attach a shell to the pod on screen, in the container picked.
+    fn attach_shell(&mut self, cx: &mut Context<Self>) {
+        let Some((key, object)) = self.key.clone().zip(self.object(cx)) else {
+            return;
+        };
+        let Some(namespace) = object.meta.namespace.clone() else {
+            return;
+        };
+        if self.store.read(cx).exec_permission(Some(&namespace)) != Some(true) {
+            return;
+        }
+        let containers = self.containers(cx);
+        let mut request = ExecRequest::attach(namespace, object.meta.name.clone());
+        if let Some(container) = self
+            .container
+            .clone()
+            .or_else(|| containers.first().cloned())
+        {
+            request = request.container(container);
+        }
+        let (cols, rows) = self.shell_cells.unwrap_or(SHELL_DEFAULT);
+        self.store.update(cx, |store, cx| {
+            store.attach_shell(key, request, cols, rows, cx)
+        });
+        cx.notify();
+    }
+
+    /// A keystroke on the Shell tab: to the shell, as bytes.
+    fn type_into_shell(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(bytes) = terminal::keystroke_bytes(&event.keystroke) else {
+            return;
+        };
+        cx.stop_propagation();
+        self.store
+            .update(cx, |store, _| store.type_into_shell(bytes));
+    }
+
+    /// The shell panel was laid out at `cols` by `rows`.
+    ///
+    /// Called from the frame, after the layout has happened; only a change
+    /// does anything, so a frame that changed nothing costs a comparison.
+    fn shell_measured(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
+        if self.shell_cells == Some((cols, rows)) {
+            return;
+        }
+        self.shell_cells = Some((cols, rows));
+        self.store
+            .update(cx, |store, cx| store.resize_shell(cols, rows, cx));
+        cx.notify();
+    }
+
+    /// The Shell tab: a container, and a terminal into it.
+    fn shell_tab(
+        &mut self,
+        object: &Object,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tokens = Tokens::global(cx).clone();
+        let containers = self.containers(cx);
+        let allowed = self
+            .store
+            .read(cx)
+            .exec_permission(object.meta.namespace.as_deref())
+            == Some(true);
+        let session = self
+            .key
+            .as_ref()
+            .zip(self.store.read(cx).shell())
+            .filter(|(key, shell)| **key == shell.pod);
+        let attached = session
+            .as_ref()
+            .map(|(_, shell)| (shell.status.clone(), shell.container.clone()));
+        let current = attached
+            .as_ref()
+            .and_then(|(_, container)| container.clone())
+            .or_else(|| self.container.clone())
+            .or_else(|| containers.first().cloned())
+            .unwrap_or_default();
+        let live = matches!(
+            attached.as_ref().map(|(status, _)| status),
+            Some(ShellStatus::Connecting | ShellStatus::Open)
+        );
+
+        let toolbar = h_flex()
+            .w_full()
+            .px_3()
+            .py_1p5()
+            .gap_1()
+            .flex_shrink_0()
+            .items_center()
+            .children(containers.into_iter().enumerate().map(|(index, name)| {
+                let selected = name == current;
+                let picked = name.clone();
+                div()
+                    .id(("shell-container", index))
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(tokens.radius.control()))
+                    .text_size(px(11.))
+                    .font_family("monospace")
+                    .when(selected, |this| {
+                        this.bg(tokens.colors().row_active())
+                            .text_color(tokens.colors().text_primary)
+                    })
+                    .when(!selected, |this| {
+                        this.text_color(tokens.colors().text_muted)
+                    })
+                    // The container cannot change under a shell that is
+                    // in it; detach first.
+                    .when(!live, |this| {
+                        this.cursor_pointer()
+                            .hover(|this| this.bg(tokens.colors().row_hover()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.container = Some(picked.clone());
+                                cx.notify();
+                            }))
+                    })
+                    .child(name)
+            }))
+            .child(div().flex_1())
+            .child(match live {
+                true => self.button(
+                    "shell-detach",
+                    rust_i18n::t!("detail.shell_detach").to_string(),
+                    true,
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.store.update(cx, |store, _| store.detach_shell());
+                        cx.notify();
+                    },
+                ),
+                false => self.button(
+                    "shell-attach",
+                    rust_i18n::t!("detail.shell_attach").to_string(),
+                    allowed,
+                    false,
+                    cx,
+                    |this, window, cx| {
+                        this.attach_shell(cx);
+                        window.focus(&this.shell_focus, cx);
+                    },
+                ),
+            });
+
+        let body: AnyElement = match attached.as_ref().map(|(status, _)| status) {
+            None => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .px_6()
+                .child(
+                    div()
+                        .max_w(px(360.))
+                        .text_size(px(11.5))
+                        .text_color(tokens.colors().text_muted)
+                        .text_center()
+                        .child(rust_i18n::t!("detail.shell_hint").to_string()),
+                )
+                .into_any_element(),
+            Some(ShellStatus::Failed(why)) => self.notice(why.clone(), true, cx),
+            Some(status) => {
+                let footnote = match status {
+                    ShellStatus::Connecting => {
+                        Some((rust_i18n::t!("detail.shell_connecting").to_string(), false))
+                    }
+                    ShellStatus::Closed => {
+                        Some((rust_i18n::t!("detail.shell_closed").to_string(), false))
+                    }
+                    _ => None,
+                };
+                v_flex()
+                    .size_full()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .child(self.shell_screen(window, cx)),
+                    )
+                    .children(footnote.map(|(text, bad)| self.notice(text, bad, cx)))
+                    .into_any_element()
+            }
+        };
+
+        v_flex()
+            .size_full()
+            .bg(tokens.colors().bg_terminal)
+            .child(toolbar)
+            .when(!allowed, |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_size(px(11.))
+                        .text_color(tokens.colors().text_muted)
+                        .child(rust_i18n::t!("action.forbidden").to_string()),
+                )
+            })
+            .child(div().flex_1().min_h_0().w_full().child(body))
+            .into_any_element()
+    }
+
+    /// The shell's screen: one styled line per row, and a ruler underneath
+    /// that measures the panel in cells so the shell can be told its size.
+    fn shell_screen(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = Tokens::global(cx).clone();
+        let colors = *tokens.colors();
+        let rows: Vec<Vec<terminal::Span>> = self
+            .store
+            .read(cx)
+            .shell()
+            .map(|shell| {
+                shell
+                    .screen
+                    .rows_of_cells()
+                    .iter()
+                    .map(|row| terminal::spans(row))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let focused = self.shell_focus.is_focused(window);
+        let mono = font("monospace");
+        let this = cx.entity().downgrade();
+
+        // The ruler: laid out under the rows at the panel's full size, it
+        // learns the bounds every frame and reports them in cells. Text
+        // width is measured rather than assumed, since the monospace font is
+        // whatever the platform resolved it to.
+        let ruler = canvas(
+            move |bounds, window, cx| {
+                let probe = TextRun {
+                    len: 10,
+                    font: mono.clone(),
+                    color: colors.text_primary,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let width = window
+                    .text_system()
+                    .shape_line("MMMMMMMMMM".into(), SHELL_FONT_SIZE, &[probe], None)
+                    .width;
+                let cell = f32::from(width) / 10.;
+                if cell <= 0. {
+                    return;
+                }
+                let cols = (f32::from(bounds.size.width) / cell).floor().max(1.) as u16;
+                let rows = (f32::from(bounds.size.height) / f32::from(LINE_HEIGHT))
+                    .floor()
+                    .max(1.) as u16;
+                this.update(cx, |this, cx| this.shell_measured(cols, rows, cx))
+                    .ok();
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+
+        div()
+            .id("shell-screen")
+            .relative()
+            .size_full()
+            .track_focus(&self.shell_focus)
+            .key_context("Shell")
+            .cursor_text()
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, _, cx| this.type_into_shell(event, cx)),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                window.focus(&this.shell_focus, cx);
+                cx.notify();
+            }))
+            .child(ruler)
+            .child(
+                v_flex()
+                    .relative()
+                    .size_full()
+                    .px_3()
+                    .overflow_hidden()
+                    .font_family("monospace")
+                    .text_size(SHELL_FONT_SIZE)
+                    .line_height(LINE_HEIGHT)
+                    .children(rows.into_iter().enumerate().map(|(index, spans)| {
+                        let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+                        let runs = spans
+                            .iter()
+                            .map(|span| shell_run(span, &colors, focused))
+                            .collect();
+                        div()
+                            .id(("shell-row", index))
+                            .h(LINE_HEIGHT)
+                            .whitespace_nowrap()
+                            .child(StyledText::new(text).with_runs(runs))
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// The Logs tab: what to read, and then the reading of it.
     fn logs(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = Tokens::global(cx).clone();
@@ -1611,6 +1950,7 @@ impl Render for Detail {
             Tab::Yaml => self.yaml(&object, window, cx),
             Tab::Logs => self.logs(cx),
             Tab::Run => self.run_tab(&object, cx),
+            Tab::Shell => self.shell_tab(&object, window, cx),
         };
         let footer = self.footer(&object, cx);
         v_flex()
@@ -1619,5 +1959,55 @@ impl Render for Detail {
             .child(tabs)
             .child(div().flex_1().min_h_0().w_full().child(body))
             .children(footer)
+    }
+}
+
+/// How one span of the shell's screen is drawn.
+///
+/// The cursor is the text colour and the ground swapped while the panel has
+/// focus, and an outline of it — a dimmer swap — while it does not, so a
+/// reader can tell where their keystrokes would go before they go there.
+fn shell_run(span: &terminal::Span, colors: &kirikumo_ui::theme::Colors, focused: bool) -> TextRun {
+    let Style {
+        foreground,
+        background,
+        bold,
+        italic,
+        underline,
+        cursor,
+    } = span.style;
+    let mut font = font("monospace");
+    if bold {
+        font.weight = FontWeight::SEMIBOLD;
+    }
+    if italic {
+        font.style = FontStyle::Italic;
+    }
+    let (color, background_color) = match cursor {
+        true => (
+            colors.bg_terminal,
+            Some(match focused {
+                true => colors.text_primary,
+                false => colors.text_muted,
+            }),
+        ),
+        false => (
+            foreground
+                .map(|colour| colors.terminal(colour))
+                .unwrap_or(colors.text_primary),
+            background.map(|colour| colors.terminal(colour)),
+        ),
+    };
+    TextRun {
+        len: span.text.len(),
+        font,
+        color,
+        background_color,
+        underline: underline.then(|| UnderlineStyle {
+            thickness: px(1.),
+            color: Some(color),
+            wavy: false,
+        }),
+        strikethrough: None,
     }
 }

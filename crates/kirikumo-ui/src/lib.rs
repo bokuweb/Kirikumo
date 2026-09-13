@@ -31,6 +31,7 @@ pub mod palette;
 pub mod paths;
 pub mod settings;
 pub mod table;
+pub mod terminal;
 pub mod theme;
 pub mod time;
 
@@ -45,4 +46,5 @@ pub use palette::{Action, Command, Entry, Here};
 pub use paths::Paths;
 pub use settings::{AppSettings, Appearance};
 pub use table::{Column, ColumnSet, Row, Width};
+pub use terminal::Screen;
 pub use theme::{Mode, Tokens};

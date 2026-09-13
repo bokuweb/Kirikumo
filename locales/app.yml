@@ -143,6 +143,24 @@ detail.run_stderr:
 detail.run_empty:
   en: The command wrote nothing.
   ja: コマンドは何も出力しませんでした。
+detail.shell:
+  en: Shell
+  ja: シェル
+detail.shell_attach:
+  en: Attach
+  ja: 接続
+detail.shell_detach:
+  en: Detach
+  ja: 切断
+detail.shell_connecting:
+  en: Attaching…
+  ja: 接続中…
+detail.shell_closed:
+  en: The shell exited.
+  ja: シェルは終了しました。
+detail.shell_hint:
+  en: "A shell in the container, through the apiserver: what the container has, sh at least. Ctrl-D or exit ends it."
+  ja: "apiserver 経由でコンテナに入ります。コンテナにあるシェル（少なくとも sh）が開きます。Ctrl-D または exit で終了します。"
 detail.conditions:
   en: Conditions
   ja: 状態

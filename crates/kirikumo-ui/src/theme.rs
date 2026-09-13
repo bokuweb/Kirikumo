@@ -7,6 +7,7 @@
 //! colour, a radius or a duration (`AGENTS.md` rule 5).
 
 use crate::settings::Appearance;
+use crate::terminal::Colour;
 use gpui::{App, Global, Hsla, Rgba, WindowAppearance};
 use kirikumo_kube::Level;
 use serde::{Deserialize, Deserializer};
@@ -249,6 +250,17 @@ pub fn parse_hex(raw: &str) -> Result<Hsla, String> {
     .into())
 }
 
+/// An exact colour as GPUI holds it.
+fn rgb_hsla(red: u8, green: u8, blue: u8) -> Hsla {
+    Rgba {
+        r: red as f32 / 255.,
+        g: green as f32 / 255.,
+        b: blue as f32 / 255.,
+        a: 1.,
+    }
+    .into()
+}
+
 impl Colors {
     /// The colour a health mark is painted in.
     ///
@@ -262,6 +274,39 @@ impl Colors {
             Level::Attention => self.status_attention,
             Level::Error => self.status_error,
             Level::Unknown => self.text_muted,
+        }
+    }
+
+    /// What a terminal's colour is in this theme.
+    ///
+    /// The eight ANSI colours and their bright halves are resolved against
+    /// the theme's own palette rather than to fixed hexes: a terminal that
+    /// hardcoded them would clash with every theme but the one it was written
+    /// on. The 216-colour cube and the greys are computed the way xterm
+    /// computes them, and what a program asked for exactly — a truecolour
+    /// escape — it gets exactly.
+    pub fn terminal(&self, colour: Colour) -> Hsla {
+        match colour {
+            Colour::Rgb(red, green, blue) => rgb_hsla(red, green, blue),
+            Colour::Named(index @ 0..=15) => match index % 8 {
+                0 => self.text_muted,
+                1 => self.status_error,
+                2 => self.status_done,
+                3 => self.status_attention,
+                4 => self.accent,
+                5 => self.status_working,
+                6 => self.text_secondary,
+                _ => self.text_primary,
+            },
+            Colour::Named(index @ 16..=231) => {
+                let index = index - 16;
+                let level = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+                rgb_hsla(level(index / 36), level((index / 6) % 6), level(index % 6))
+            }
+            Colour::Named(index) => {
+                let grey = 8 + (index - 232) * 10;
+                rgb_hsla(grey, grey, grey)
+            }
         }
     }
 
@@ -408,6 +453,23 @@ mod tests {
             assert!(!tokens.name.is_empty());
             assert_eq!(tokens.radius.window, 12.0);
         }
+    }
+
+    #[test]
+    fn a_terminals_colours_come_from_the_theme_or_from_xterm() {
+        let colors = Tokens::load(Mode::Dark).colors;
+        // Red, and bright red, are the theme's error colour.
+        assert_eq!(colors.terminal(Colour::Named(1)), colors.status_error);
+        assert_eq!(colors.terminal(Colour::Named(9)), colors.status_error);
+        // The cube: 16 is black, 231 is white, 196 is pure red.
+        assert_eq!(colors.terminal(Colour::Named(16)), rgb_hsla(0, 0, 0));
+        assert_eq!(colors.terminal(Colour::Named(231)), rgb_hsla(255, 255, 255));
+        assert_eq!(colors.terminal(Colour::Named(196)), rgb_hsla(255, 0, 0));
+        // The greys: 232 is the darkest, 255 the lightest.
+        assert_eq!(colors.terminal(Colour::Named(232)), rgb_hsla(8, 8, 8));
+        assert_eq!(colors.terminal(Colour::Named(255)), rgb_hsla(238, 238, 238));
+        // And an exact one is exact.
+        assert_eq!(colors.terminal(Colour::Rgb(1, 2, 3)), rgb_hsla(1, 2, 3));
     }
 
     #[test]
